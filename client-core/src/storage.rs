@@ -11,7 +11,7 @@ use miscreant::{Aead, Aes128PmacSivAead};
 use rand::rngs::OsRng;
 use rand::Rng;
 
-use crate::{Error, ErrorKind};
+use crate::{ErrorKind, Result};
 
 /// Nonce size in bytes
 const NONCE_SIZE: usize = 8;
@@ -19,40 +19,37 @@ const NONCE_SIZE: usize = 8;
 /// Interface for a generic key-value storage
 pub trait Storage {
     /// Clears all data in storage.
-    fn clear(&self) -> Result<(), Error>;
+    fn clear(&self) -> Result<()>;
 
     /// Returns value of key if it exists.
-    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error>;
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>>;
 
     /// Set a key to a new value, returning old value if it was set.
-    fn set(&self, key: &[u8], value: Vec<u8>) -> Result<Option<Vec<u8>>, Error>;
+    fn set(&self, key: &[u8], value: Vec<u8>) -> Result<Option<Vec<u8>>>;
 
     /// Returns a vector of stored keys
-    fn keys(&self) -> Result<Vec<Vec<u8>>, Error>;
+    fn keys(&self) -> Result<Vec<Vec<u8>>>;
 
     /// Returns `true` if the storage contains a value for the specified key, `false` otherwise.
-    fn contains_key(&self, key: &[u8]) -> Result<bool, Error>;
+    fn contains_key(&self, key: &[u8]) -> Result<bool>;
 }
 
 /// Interface for a generic key-value storage (with encryption)
-pub trait SecuredStorage {
+pub trait SecureStorage {
     /// Returns value (after decryption) of key if it exists.
-    fn get_secured(&self, key: &[u8], passphrase: &[u8]) -> Result<Option<Vec<u8>>, Error>;
+    fn get_secure(&self, key: &[u8], passphrase: &[u8]) -> Result<Option<Vec<u8>>>;
 
-    /// Set a key to a new value (after encryption), returning old value if it was set.
-    fn set_secured(
-        &self,
-        key: &[u8],
-        value: Vec<u8>,
-        passphrase: &[u8],
-    ) -> Result<Option<Vec<u8>>, Error>;
+    /// Set a key to a new value (after encryption). This function returns [`Error`](crate::Error) of
+    /// [`ErrorKind`](crate::ErrorKind): `AlreadyExists` when the specified key is already present in
+    /// storage.
+    fn set_secure(&self, key: &[u8], value: Vec<u8>, passphrase: &[u8]) -> Result<()>;
 }
 
-impl<T> SecuredStorage for T
+impl<T> SecureStorage for T
 where
     T: Storage,
 {
-    fn get_secured(&self, key: &[u8], passphrase: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+    fn get_secure(&self, key: &[u8], passphrase: &[u8]) -> Result<Option<Vec<u8>>> {
         let value = self.get(key)?;
 
         match value {
@@ -69,26 +66,27 @@ where
         }
     }
 
-    fn set_secured(
-        &self,
-        key: &[u8],
-        value: Vec<u8>,
-        passphrase: &[u8],
-    ) -> Result<Option<Vec<u8>>, Error> {
-        let mut algo = get_algo(passphrase)?;
+    fn set_secure(&self, key: &[u8], value: Vec<u8>, passphrase: &[u8]) -> Result<()> {
+        if self.contains_key(key)? {
+            Err(ErrorKind::AlreadyExists.into())
+        } else {
+            let mut algo = get_algo(passphrase)?;
 
-        let mut nonce = [0u8; NONCE_SIZE];
-        let mut rand = OsRng::new().context(ErrorKind::RngError)?;
-        rand.fill(&mut nonce);
+            let mut nonce = [0u8; NONCE_SIZE];
+            let mut rand = OsRng::new().context(ErrorKind::RngError)?;
+            rand.fill(&mut nonce);
 
-        let mut cipher = algo.seal(&nonce, key, &value);
-        cipher.extend(&nonce[..]);
+            let mut cipher = algo.seal(&nonce, key, &value);
+            cipher.extend(&nonce[..]);
 
-        self.set(key, cipher)
+            self.set(key, cipher)?;
+
+            Ok(())
+        }
     }
 }
 
-fn get_algo(passphrase: &[u8]) -> Result<Aes128PmacSivAead, Error> {
+fn get_algo(passphrase: &[u8]) -> Result<Aes128PmacSivAead> {
     let mut hasher = Blake2s::new();
     hasher.input(passphrase);
 

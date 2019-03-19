@@ -4,14 +4,14 @@ use rand::rngs::OsRng;
 use secp256k1::{PublicKey as SecpPublicKey, SecretKey};
 
 use crate::SECP;
-use crate::{Error, ErrorKind};
+use crate::{ErrorKind, Result};
 
 /// Private key used in Crypto.com Chain
 pub struct PrivateKey(SecretKey);
 
 impl PrivateKey {
     /// Generates a new private key
-    pub fn new() -> Result<PrivateKey, Error> {
+    pub fn new() -> Result<PrivateKey> {
         let mut rng = OsRng::new().context(ErrorKind::KeyGenerationError)?;
         let secret_key = SecretKey::new(&mut rng);
 

@@ -13,6 +13,7 @@
 //! - Persistent storage implementation using [`Sled`](https://crates.io/crates/sled)
 //!   - This feature implements [`Storage`](crate::Storage) trait using `Sled` embedded database.
 //!   - Enable with `"sled"` feature flag.
+//!   - This feature is enabled by default.
 //!
 pub mod error;
 pub mod key;
@@ -21,7 +22,7 @@ pub mod storage;
 #[doc(inline)]
 pub use error::{Error, ErrorKind, Result};
 #[doc(inline)]
-pub use storage::{SecuredStorage, Storage};
+pub use storage::{SecureStorage, Storage};
 
 use secp256k1::{All, Secp256k1};
 

@@ -4,7 +4,7 @@ use std::fmt;
 use failure::{Backtrace, Context, Fail};
 
 /// Alias of `Result` objects that return [`Error`]
-/// 
+///
 /// [`Error`]: self::Error
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -32,6 +32,9 @@ pub enum ErrorKind {
     /// Decryption error
     #[fail(display = "Decryption error")]
     DecryptionError,
+    /// Already exists in storage
+    #[fail(display = "Already exists in storage")]
+    AlreadyExists,
 }
 
 impl Fail for Error {

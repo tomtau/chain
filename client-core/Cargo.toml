@@ -15,4 +15,4 @@ blake2 = "0.8"
 sled = { version = "0.19", optional = true }
 
 [features]
-default = []
+default = ["sled"]
