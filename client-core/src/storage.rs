@@ -56,7 +56,7 @@ where
             None => Ok(None),
             Some(inner) => {
                 let nonce_index = inner.len() - NONCE_SIZE;
-                let mut algo = get_algo(passphrase)?;
+                let mut algo = get_algo(passphrase);
 
                 Ok(Some(
                     algo.open(&inner[nonce_index..], key, &inner[..nonce_index])
@@ -70,7 +70,7 @@ where
         if self.contains_key(key)? {
             Err(ErrorKind::AlreadyExists.into())
         } else {
-            let mut algo = get_algo(passphrase)?;
+            let mut algo = get_algo(passphrase);
 
             let mut nonce = [0u8; NONCE_SIZE];
             let mut rand = OsRng::new().context(ErrorKind::RngError)?;
@@ -86,11 +86,9 @@ where
     }
 }
 
-fn get_algo(passphrase: &[u8]) -> Result<Aes128PmacSivAead> {
+fn get_algo(passphrase: &[u8]) -> Aes128PmacSivAead {
     let mut hasher = Blake2s::new();
     hasher.input(passphrase);
 
-    let algo = Aes128PmacSivAead::new(&hasher.result_reset());
-
-    Ok(algo)
+    Aes128PmacSivAead::new(&hasher.result_reset())
 }

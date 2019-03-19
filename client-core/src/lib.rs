@@ -22,6 +22,8 @@ pub mod storage;
 #[doc(inline)]
 pub use error::{Error, ErrorKind, Result};
 #[doc(inline)]
+pub use key::{PrivateKey, PublicKey};
+#[doc(inline)]
 pub use storage::{SecureStorage, Storage};
 
 use secp256k1::{All, Secp256k1};
