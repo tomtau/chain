@@ -6,5 +6,6 @@ members = [
     "dev-utils",
     "signer-core",
     "signer-cli",
-    "signer-rpc"
+    "signer-rpc",
+    "client-core"
 ]
