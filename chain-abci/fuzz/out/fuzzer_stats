@@ -1,0 +1,28 @@
+start_time        : 1560504391
+last_update       : 1560737034
+fuzzer_pid        : 98528
+cycles_done       : 3
+execs_done        : 19981099
+execs_per_sec     : 948.25
+paths_total       : 243
+paths_favored     : 86
+paths_found       : 242
+paths_imported    : 0
+max_depth         : 10
+cur_path          : 192
+pending_favs      : 0
+pending_total     : 132
+variable_paths    : 241
+stability         : 98.97%
+bitmap_cvg        : 9.29%
+unique_crashes    : 0
+unique_hangs      : 0
+last_path         : 1560734552
+last_crash        : 0
+last_hang         : 0
+execs_since_crash : 19981099
+exec_timeout      : 20
+afl_banner        : checktx
+afl_version       : 2.52b
+target_mode       : persistent deferred 
+command_line      : /Users/tomas/.local/share/afl.rs/rustc-1.37.0-nightly-0e4a56b/afl.rs-0.4.3/afl/bin/afl-fuzz -i in -o out target/debug/checktx
