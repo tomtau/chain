@@ -10,7 +10,7 @@ chain-tx-filter = { path = "../chain-tx-filter" }
 secp256k1zkp = { git = "https://github.com/crypto-com/rust-secp256k1-zkp.git", rev = "8b9a38b870a7759fcdbd4a5d435b5ba873c70afd", features = ["serde", "zeroize", "rand", "recovery", "endomorphism", "musig"] }
 rand = "0.7"
 log = "0.4"
-miscreant = "0.4"
+aes-gcm-siv = "0.3"
 blake2 = "0.8"
 hex = "0.4"
 base64 = "0.11"
@@ -21,8 +21,10 @@ chrono = { version = "0.4", features = ["serde"] }
 sled = { version = "0.29", optional = true }
 jsonrpc = { version = "0.11", optional = true }
 serde_json = { version = "1.0", optional = true }
-parity-scale-codec = { features = ["derive"], version = "1.0" }
+parity-scale-codec = { features = ["derive"], version = "1.1" }
 websocket = { version = "0.24", default-features = false, features = ["sync"], optional = true }
+tendermint = { git = "https://github.com/crypto-com/tendermint-rs.git", rev = "ce6cf1e1e275411c0757fe9ee95146c7875843a8" }
+itertools = "0.8"
 
 [features]
 default = ["sled", "websocket-rpc"]

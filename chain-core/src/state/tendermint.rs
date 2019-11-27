@@ -16,7 +16,7 @@ pub type BlockHeight = i64;
 /// The protobuf structure currently has "String" to denote the type / length
 /// and variable length byte array. In this internal representation,
 /// it's desirable to keep it restricted and compact. (TM should be encoding using the compressed form.)
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Encode, Decode)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Clone, Encode, Decode)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum TendermintValidatorPubKey {
     Ed25519([u8; 32]),
@@ -25,6 +25,15 @@ pub enum TendermintValidatorPubKey {
     // "type = "ed25519" anddata = <raw 32-byte public key>`"
     // there's also PubKeyMultisigThreshold, but that probably wouldn't be used for individual nodes / validators
     // TODO: some other schemes when they are added in TM?
+}
+
+#[cfg(feature = "hex")]
+impl fmt::Display for TendermintValidatorPubKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TendermintValidatorPubKey::Ed25519(key) => write!(f, "{}", hex::encode(key)),
+        }
+    }
 }
 
 impl TendermintValidatorPubKey {
@@ -168,12 +177,19 @@ impl TryFrom<&[u8]> for TendermintValidatorAddress {
 pub const TENDERMINT_MAX_VOTE_POWER: i64 = std::i64::MAX / 1000;
 
 /// Tendermint consensus voting power
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Encode, Decode)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TendermintVotePower(i64);
 
 impl From<TendermintVotePower> for i64 {
     fn from(c: TendermintVotePower) -> i64 {
         c.0
+    }
+}
+
+impl From<TendermintVotePower> for u64 {
+    fn from(c: TendermintVotePower) -> u64 {
+        c.0 as u64
     }
 }
 

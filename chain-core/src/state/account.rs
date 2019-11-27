@@ -20,12 +20,14 @@ use std::str::FromStr;
 // TODO: switch to normal signatures + explicit public key
 #[cfg(feature = "hex")]
 use crate::init::address::ErrorAddress;
+use crate::state::tendermint::TendermintValidatorPubKey;
 use secp256k1::recovery::{RecoverableSignature, RecoveryId};
 use std::convert::From;
 #[cfg(feature = "hex")]
 use std::convert::TryFrom;
 #[cfg(feature = "hex")]
 use std::fmt;
+use std::prelude::v1::{String, ToString};
 
 /// Each input is 34 bytes
 ///
@@ -118,6 +120,129 @@ impl FromStr for StakedStateAddress {
     }
 }
 
+pub type ValidatorName = String;
+pub type ValidatorSecurityContact = Option<String>;
+
+/// holds state about a node responsible for transaction validation / block signing and service node whitelist management
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+#[cfg_attr(
+    all(feature = "serde", feature = "hex"),
+    derive(Serialize, Deserialize)
+)]
+pub struct CouncilNode {
+    // validator name / moniker (just for reference / human use)
+    pub name: ValidatorName,
+    // optional security@... email address
+    pub security_contact: ValidatorSecurityContact,
+    // Tendermint consensus validator-associated public key
+    pub consensus_pubkey: TendermintValidatorPubKey,
+}
+
+impl Encode for CouncilNode {
+    fn encode_to<W: Output>(&self, dest: &mut W) {
+        self.name.encode_to(dest);
+        match &self.security_contact {
+            None => dest.push_byte(0),
+            Some(c) => {
+                dest.push_byte(1);
+                c.encode_to(dest);
+            }
+        };
+        self.consensus_pubkey.encode_to(dest);
+    }
+}
+
+const MAX_STRING_LEN: usize = 255;
+
+impl Decode for CouncilNode {
+    fn decode<I: Input>(input: &mut I) -> Result<Self, Error> {
+        let name_raw: Vec<u8> = Vec::decode(input)?;
+        if name_raw.len() > MAX_STRING_LEN {
+            return Err(Error::from("Validator name longer than 255 chars"));
+        }
+        let name =
+            String::from_utf8(name_raw).map_err(|_| Error::from("Invalid validator name"))?;
+        let security_contact_raw: Option<Vec<u8>> = Option::decode(input)?;
+        let security_contact = match security_contact_raw {
+            Some(c) => {
+                if c.len() > MAX_STRING_LEN {
+                    return Err(Error::from("Security contact longer than 255 chars"));
+                }
+                Some(String::from_utf8(c).map_err(|_| Error::from("Invalid security contact"))?)
+            }
+            None => None,
+        };
+        let consensus_pubkey = TendermintValidatorPubKey::decode(input)?;
+        Ok(CouncilNode::new_with_details(
+            name,
+            security_contact,
+            consensus_pubkey,
+        ))
+    }
+}
+
+impl CouncilNode {
+    pub fn new(consensus_pubkey: TendermintValidatorPubKey) -> Self {
+        CouncilNode {
+            name: "no-name".to_string(),
+            security_contact: None,
+            consensus_pubkey,
+        }
+    }
+
+    pub fn new_with_details(
+        name: ValidatorName,
+        security_contact: ValidatorSecurityContact,
+        consensus_pubkey: TendermintValidatorPubKey,
+    ) -> Self {
+        CouncilNode {
+            name,
+            security_contact,
+            consensus_pubkey,
+        }
+    }
+}
+
+/// Types of possible punishments
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+#[cfg_attr(
+    all(feature = "serde", feature = "hex"),
+    derive(Deserialize, Serialize)
+)]
+pub enum PunishmentKind {
+    NonLive,
+    ByzantineFault,
+}
+
+#[cfg(feature = "hex")]
+impl fmt::Display for PunishmentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PunishmentKind::NonLive => write!(f, "Non-live"),
+            PunishmentKind::ByzantineFault => write!(f, "Byzantine fault"),
+        }
+    }
+}
+
+/// Details of a punishment for a staked state
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+#[cfg_attr(
+    all(feature = "serde", feature = "hex"),
+    derive(Deserialize, Serialize)
+)]
+pub struct Punishment {
+    pub kind: PunishmentKind,
+    pub jailed_until: Timespec,
+    pub slash_amount: Option<Coin>,
+}
+
+#[cfg(feature = "hex")]
+impl fmt::Display for CouncilNode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} -- {}", self.name, self.consensus_pubkey)
+    }
+}
+
 /// represents the StakedState (account involved in staking)
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 #[cfg_attr(
@@ -130,8 +255,8 @@ pub struct StakedState {
     pub unbonded: Coin,
     pub unbonded_from: Timespec,
     pub address: StakedStateAddress,
-    pub jailed_until: Option<Timespec>,
-    // TODO: slashing
+    pub punishment: Option<Punishment>,
+    pub council_node: Option<CouncilNode>,
 }
 
 /// the tree used in StakedState storage db has a hardcoded 32-byte keys,
@@ -165,7 +290,7 @@ impl StakedState {
         unbonded: Coin,
         unbonded_from: Timespec,
         address: StakedStateAddress,
-        jailed_until: Option<Timespec>,
+        punishment: Option<Punishment>,
     ) -> Self {
         StakedState {
             nonce,
@@ -173,32 +298,39 @@ impl StakedState {
             unbonded,
             unbonded_from,
             address,
-            jailed_until,
+            punishment,
+            council_node: None,
         }
     }
 
-    /// creates a StakedState at "genesis" (amount is either all bonded or unbonded depending on `destination` argument)
-    pub fn new_init(
+    /// creates a bonded StakedState with a validator metadata specified at genesis
+    pub fn new_init_bonded(
         amount: Coin,
-        genesis_time: Option<Timespec>,
+        genesis_time: Timespec,
         address: StakedStateAddress,
-        destination: &StakedStateDestination,
+        council_node: Option<CouncilNode>,
     ) -> Self {
-        let (bonded, unbonded, unbonded_from) = match *destination {
-            StakedStateDestination::Bonded => (amount, Coin::zero(), genesis_time.unwrap_or(0)),
-            StakedStateDestination::UnbondedFromGenesis => {
-                (Coin::zero(), amount, genesis_time.unwrap_or(0))
-            }
-            StakedStateDestination::UnbondedFromCustomTime(t) => (Coin::zero(), amount, t),
-        };
-
         StakedState {
             nonce: 0,
-            bonded,
-            unbonded,
-            unbonded_from,
+            bonded: amount,
+            unbonded: Coin::zero(),
+            unbonded_from: genesis_time,
             address,
-            jailed_until: None,
+            punishment: None,
+            council_node,
+        }
+    }
+
+    /// creates a StakedState at unbonded at specified time
+    pub fn new_init_unbonded(amount: Coin, time: Timespec, address: StakedStateAddress) -> Self {
+        StakedState {
+            nonce: 0,
+            bonded: Coin::zero(),
+            unbonded: amount,
+            unbonded_from: time,
+            address,
+            punishment: None,
+            council_node: None,
         }
     }
 
@@ -224,6 +356,12 @@ impl StakedState {
         self.unbonded = Coin::zero();
     }
 
+    /// in-place update after node join request
+    pub fn join_node(&mut self, council_node: CouncilNode) {
+        self.nonce += 1;
+        self.council_node = Some(council_node);
+    }
+
     /// the tree used in StakedState storage db has a hardcoded 32-byte keys,
     /// this computes a key as blake2s(StakedState.address) where
     /// the StakedState address itself is ETH-style address (20 bytes from keccak hash of public key)
@@ -234,30 +372,40 @@ impl StakedState {
     /// Checks if current account is jailed
     #[inline]
     pub fn is_jailed(&self) -> bool {
-        self.jailed_until.is_some()
+        self.punishment.is_some()
     }
 
     /// Returns `jailed_until` for current account, `None` if current account is not jailed
     #[inline]
     pub fn jailed_until(&self) -> Option<Timespec> {
-        self.jailed_until
+        self.punishment
+            .as_ref()
+            .map(|punishment| punishment.jailed_until)
     }
 
     /// Jails current account until given time
-    pub fn jail_until(&mut self, jail_until: Timespec) {
+    pub fn jail_until(&mut self, jailed_until: Timespec, kind: PunishmentKind) {
         self.nonce += 1;
-        self.jailed_until = Some(jail_until)
+        self.punishment = Some(Punishment {
+            kind,
+            jailed_until,
+            slash_amount: None,
+        });
     }
 
     /// Unjails current account
     pub fn unjail(&mut self) {
         self.nonce += 1;
-        self.jailed_until = None;
+        self.punishment = None;
     }
 
     /// Slashes current account with given ratio and returns slashed amount
     #[cfg(feature = "base64")]
-    pub fn slash(&mut self, slash_ratio: SlashRatio) -> Result<Coin, CoinError> {
+    pub fn slash(
+        &mut self,
+        slash_ratio: SlashRatio,
+        punishment_kind: PunishmentKind,
+    ) -> Result<Coin, CoinError> {
         self.nonce += 1;
 
         let bonded_slash_value = self.bonded * slash_ratio;
@@ -266,7 +414,14 @@ impl StakedState {
         self.bonded = (self.bonded - bonded_slash_value)?;
         self.unbonded = (self.unbonded - unbonded_slash_value)?;
 
-        bonded_slash_value + unbonded_slash_value
+        let slash_amount = (bonded_slash_value + unbonded_slash_value)?;
+
+        if let Some(ref mut punishment) = self.punishment {
+            punishment.slash_amount = Some(slash_amount);
+            punishment.kind = punishment_kind;
+        }
+
+        Ok(slash_amount)
     }
 }
 
@@ -521,6 +676,55 @@ impl Decode for StakedStateOpWitness {
                 Ok(StakedStateOpWitness::BasicRedeem(sig))
             }
             _ => Err(Error::from("Invalid tag")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+    use quickcheck::quickcheck;
+    use quickcheck::Arbitrary;
+    use quickcheck::Gen;
+
+    impl Arbitrary for CouncilNode {
+        fn arbitrary<G: Gen>(g: &mut G) -> Self {
+            let name = String::arbitrary(g);
+            let mut raw_pubkey = [0u8; 32];
+            g.fill_bytes(&mut raw_pubkey);
+            let security_contact = if bool::arbitrary(g) {
+                let contact = String::arbitrary(g);
+                Some(contact)
+            } else {
+                None
+            };
+            CouncilNode::new_with_details(
+                name,
+                security_contact,
+                TendermintValidatorPubKey::Ed25519(raw_pubkey),
+            )
+        }
+    }
+
+    fn has_valid_len(council_node: &CouncilNode) -> bool {
+        match (council_node.name.len(), &council_node.security_contact) {
+            (i, Some(ref c)) if (i <= MAX_STRING_LEN && c.len() <= MAX_STRING_LEN) => true,
+            (i, None) if i <= MAX_STRING_LEN => true,
+            _ => false,
+        }
+    }
+
+    quickcheck! {
+        // tests if decode(encode(x)) == x
+        fn prop_encode_decode_council_node(council_node: CouncilNode) -> bool {
+            if has_valid_len(&council_node) {
+                let encoded = council_node.encode();
+                CouncilNode::decode(&mut encoded.as_ref()).expect("decode council node") == council_node
+            } else {
+                let encoded = council_node.encode();
+                CouncilNode::decode(&mut encoded.as_ref()).is_err()
+            }
         }
     }
 }

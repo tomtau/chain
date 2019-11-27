@@ -5,13 +5,14 @@ authors = ["Calvin Lau <calvin@crypto.com>"]
 edition = "2018"
 
 [dependencies]
+base64 = "0.11"
 dirs = "2.0.2"
 chain-tx-filter = { path = "../chain-tx-filter" }
 chain-core = { path = "../chain-core" }
 client-common = { path = "../client-common" }
 client-core = { path = "../client-core" }
 client-network = { path= "../client-network"}
-serde_json = "1.0.41"
+serde_json = "1.0.42"
 jsonrpc-http-server = "14.0"
 jsonrpc-core = "14.0"
 jsonrpc-core-client = "14.0"
@@ -27,4 +28,4 @@ zeroize = "1.0"
 tiny-bip39 = { version = "0.6", default-features = false }
 
 [dev-dependencies]
-parity-scale-codec = "1.0"
+parity-scale-codec = "1.1"

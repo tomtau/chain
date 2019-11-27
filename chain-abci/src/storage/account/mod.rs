@@ -3,16 +3,24 @@
 /// Internal definitions
 mod tree;
 
-use crate::storage::Storage;
-use chain_core::common::H256;
-use chain_core::state::account::StakedState;
-use parity_scale_codec::{Decode as ScaleDecode, Encode as ScaleEncode};
-use starling::constants::KEY_LEN;
-use starling::traits::{Database, Decode, Encode, Exception};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use kvdb_memorydb::create as create_memorydb;
+use parity_scale_codec::{Decode as ScaleDecode, Encode as ScaleEncode};
+use starling::constants::KEY_LEN;
+use starling::merkle_bit::BinaryMerkleTreeResult;
+use starling::traits::{Database, Decode, Encode, Exception};
+
+use crate::storage::Storage;
+use chain_core::common::H256;
+use chain_core::state::account::StakedState;
+
 pub type AccountStorage = tree::HashTree<AccountWrapper, Storage>;
+
+pub fn pure_account_storage(depth: usize) -> BinaryMerkleTreeResult<AccountStorage> {
+    AccountStorage::new(Storage::new_db(Arc::new(create_memorydb(1))), depth)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AccountWrapper(pub StakedState);
@@ -90,9 +98,10 @@ mod test {
     use chain_core::common::Timespec;
     use chain_core::init::address::RedeemAddress;
     use chain_core::init::coin::Coin;
-    use chain_core::state::account::Nonce;
-    use chain_core::state::account::StakedState;
-    use chain_core::state::account::StakedStateAddress;
+    use chain_core::state::account::{
+        CouncilNode, Nonce, Punishment, PunishmentKind, StakedState, StakedStateAddress,
+    };
+    use chain_core::state::tendermint::TendermintValidatorPubKey;
     use kvdb_memorydb::create;
     use quickcheck::quickcheck;
     use quickcheck::Arbitrary;
@@ -104,18 +113,38 @@ mod test {
             let nonce: Nonce = g.next_u64();
             let bonded: u32 = g.next_u64() as u32;
             let unbonded: u32 = g.next_u64() as u32;
-            let unbonded_from: Timespec = g.next_u64() as i64;
+            let unbonded_from: Timespec = g.next_u64();
             let mut raw_address = [0u8; 20];
             g.fill_bytes(&mut raw_address);
             let address: StakedStateAddress =
                 StakedStateAddress::from(RedeemAddress::from(raw_address));
+            let punishment = if bool::arbitrary(g) {
+                let time = u64::arbitrary(g);
+                Some(Punishment {
+                    kind: PunishmentKind::NonLive,
+                    jailed_until: time,
+                    slash_amount: None,
+                })
+            } else {
+                None
+            };
+            let council_node = if bool::arbitrary(g) {
+                let mut raw_pubkey = [0u8; 32];
+                g.fill_bytes(&mut raw_pubkey);
+                Some(CouncilNode::new(TendermintValidatorPubKey::Ed25519(
+                    raw_pubkey,
+                )))
+            } else {
+                None
+            };
             AccountWrapper(StakedState {
                 nonce,
                 bonded: Coin::from(bonded),
                 unbonded: Coin::from(unbonded),
                 unbonded_from,
                 address,
-                jailed_until: None,
+                punishment,
+                council_node,
             })
         }
     }

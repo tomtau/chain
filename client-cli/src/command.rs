@@ -2,6 +2,7 @@ mod address_command;
 mod transaction_command;
 mod wallet_command;
 
+use std::convert::TryInto;
 use std::sync::mpsc::channel;
 use std::thread;
 
@@ -16,6 +17,7 @@ use structopt::StructOpt;
 use chain_core::init::coin::Coin;
 use chain_core::state::account::StakedStateAddress;
 use client_common::storage::SledStorage;
+use client_common::tendermint::types::GenesisExt;
 use client_common::tendermint::{Client, WebsocketRpcClient};
 use client_common::{ErrorKind, Result, ResultExt, Storage};
 #[cfg(not(feature = "mock-enc-dec"))]
@@ -271,7 +273,10 @@ impl Command {
                     Cell::new("Unbonded From", bold),
                     Cell::new(
                         &<DateTime<Local>>::from(DateTime::<Utc>::from_utc(
-                            NaiveDateTime::from_timestamp(staked_state.unbonded_from, 0),
+                            NaiveDateTime::from_timestamp(
+                                staked_state.unbonded_from.try_into().unwrap(),
+                                0,
+                            ),
                             Utc,
                         )),
                         justify_right,
@@ -279,15 +284,37 @@ impl Command {
                 ]),
                 Row::new(vec![
                     Cell::new("Jailed Until", bold),
-                    staked_state.jailed_until.map_or_else(
+                    staked_state.punishment.as_ref().map_or_else(
                         || Cell::new("Not jailed", justify_right),
-                        |jailed_until| {
+                        |punishment| {
                             Cell::new(
                                 &<DateTime<Local>>::from(DateTime::<Utc>::from_utc(
-                                    NaiveDateTime::from_timestamp(jailed_until, 0),
+                                    NaiveDateTime::from_timestamp(
+                                        punishment.jailed_until.try_into().unwrap(),
+                                        0,
+                                    ),
                                     Utc,
                                 )),
                                 justify_right,
+                            )
+                        },
+                    ),
+                ]),
+                Row::new(vec![
+                    Cell::new("Punishment Type", bold),
+                    staked_state.punishment.as_ref().map_or_else(
+                        || Cell::new("Not punished", justify_right),
+                        |punishment| Cell::new(&punishment.kind.to_string(), justify_right),
+                    ),
+                ]),
+                Row::new(vec![
+                    Cell::new("Slash Amount", bold),
+                    staked_state.punishment.as_ref().map_or_else(
+                        || Cell::new("Not punished", justify_right),
+                        |punishment| {
+                            punishment.slash_amount.map_or_else(
+                                || Cell::new("Not slashed", justify_right),
+                                |slash_amount| Cell::new(&slash_amount, justify_right),
                             )
                         },
                     ),
@@ -403,6 +430,7 @@ impl Command {
                     ProgressReport::Init {
                         start_block_height,
                         finish_block_height,
+                        ..
                     } => {
                         init_block_height = start_block_height;
                         final_block_height = finish_block_height;
@@ -414,6 +442,7 @@ impl Command {
                     }
                     ProgressReport::Update {
                         current_block_height,
+                        ..
                     } => {
                         if let Some(ref mut pb) = progress_bar {
                             if current_block_height == final_block_height {

@@ -2,9 +2,10 @@ use std::convert::TryInto;
 
 use abci::{Event, KVPair};
 
-use chain_core::common::TendermintEventType;
+use chain_core::common::{TendermintEventKey, TendermintEventType};
 use chain_core::init::config::SlashRatio;
 use chain_core::state::account::StakedStateAddress;
+use chain_core::state::tendermint::TendermintVotePower;
 use chain_core::tx::fee::Milli;
 use chain_tx_validation::Error;
 
@@ -23,6 +24,7 @@ impl<T: EnclaveProxy> ChainNodeApp<T> {
         let current_time = last_state.block_time;
 
         let accounts_to_slash: Vec<StakedStateAddress> = last_state
+            .validators
             .punishment
             .slashing_schedule
             .iter()
@@ -40,7 +42,7 @@ impl<T: EnclaveProxy> ChainNodeApp<T> {
 
         for staking_address in accounts_to_slash {
             let mut kvpair = KVPair::new();
-            kvpair.key = b"account".to_vec();
+            kvpair.key = TendermintEventKey::Account.into();
             kvpair.value = staking_address.to_string().into_bytes();
 
             slashing_event.attributes.push(kvpair);
@@ -56,13 +58,14 @@ impl<T: EnclaveProxy> ChainNodeApp<T> {
             }
 
             let schedule = last_state
+                .validators
                 .punishment
                 .slashing_schedule
                 .remove(&staking_address)
                 .unwrap();
 
             let slashed_amount = account
-                .slash(schedule.slash_ratio)
+                .slash(schedule.slash_ratio, schedule.punishment_kind)
                 .map_err(|_| Error::InvalidSum)?;
 
             last_state.rewards_pool.remaining = (last_state.rewards_pool.remaining
@@ -81,6 +84,7 @@ impl<T: EnclaveProxy> ChainNodeApp<T> {
         Ok(slashing_event)
     }
 
+    // TODO: maintain this value rather than recomputing it
     fn get_total_vote_power(&self) -> Milli {
         Milli::new(
             self.validator_voting_power
@@ -97,17 +101,25 @@ impl<T: EnclaveProxy> ChainNodeApp<T> {
         accounts_to_slash: I,
     ) -> SlashRatio {
         let total_vote_power = self.get_total_vote_power();
+        let last_state = self
+            .last_state
+            .as_ref()
+            .expect("Last state is not present, init_chain was not called");
 
         let slashing_proportion = Milli::from_millis(
             accounts_to_slash
                 .map(|address| {
                     let validator_voting_power = Milli::new(
-                        i64::from(
-                            *self
-                                .validator_voting_power
-                                .get(&address)
-                                .expect("Voting power for a validator not found"),
-                        ) as u64,
+                        TendermintVotePower::from(
+                            get_account(
+                                &address,
+                                &last_state.last_account_root_hash,
+                                &self.accounts,
+                            )
+                            .expect("Voting power for a validator not found")
+                            .bonded,
+                        )
+                        .into(),
                         0,
                     );
 

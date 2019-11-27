@@ -1,11 +1,8 @@
 use std::collections::BTreeSet;
 use std::str::FromStr;
 
-use bip39::{Language, Mnemonic};
 use jsonrpc_core::Result;
 use jsonrpc_derive::rpc;
-use secstr::*;
-use zeroize::Zeroize;
 
 use chain_core::init::coin::Coin;
 use chain_core::tx::data::access::{TxAccess, TxAccessPolicy};
@@ -14,10 +11,10 @@ use chain_core::tx::data::attribute::TxAttributes;
 use chain_core::tx::data::output::TxOut;
 use chain_core::tx::TxObfuscated;
 use chain_core::tx::{TxAux, TxEnclaveAux};
-use client_common::{ErrorKind, PublicKey, Result as CommonResult, ResultExt};
+use client_common::{PublicKey, Result as CommonResult};
 use client_core::types::TransactionChange;
 use client_core::types::WalletKind;
-use client_core::{MultiSigWalletClient, WalletClient};
+use client_core::{Mnemonic, MultiSigWalletClient, WalletClient};
 
 use crate::server::{rpc_error_from_string, to_rpc_error, WalletRequest};
 
@@ -30,7 +27,7 @@ pub trait WalletRpc: Send + Sync {
     fn create(&self, request: WalletRequest, walletkind: WalletKind) -> Result<String>;
 
     #[rpc(name = "wallet_restore")]
-    fn restore(&self, request: WalletRequest, mnemonics: SecUtf8) -> Result<String>;
+    fn restore(&self, request: WalletRequest, mnemonics: Mnemonic) -> Result<String>;
 
     #[rpc(name = "wallet_createStakingAddress")]
     fn create_staking_address(&self, request: WalletRequest) -> Result<String>;
@@ -109,28 +106,19 @@ where
 
         match (kind, mnemonic) {
             (WalletKind::Basic, None) => Ok(request.name),
-            (WalletKind::HD, Some(mnemonic)) => Ok(mnemonic.to_string()),
+            (WalletKind::HD, Some(mnemonic)) => Ok(mnemonic.unsecure_phrase().to_string()),
             _ => Err(rpc_error_from_string(
                 "Internal Error: Invalid mnemonic for given wallet kind".to_owned(),
             )),
         }
     }
 
-    fn restore(&self, request: WalletRequest, mnemonic: SecUtf8) -> Result<String> {
-        let mnemonic = Mnemonic::from_phrase(mnemonic.unsecure(), Language::English)
-            .chain(|| {
-                (
-                    ErrorKind::DeserializationError,
-                    "Unable to deserialize mnemonic",
-                )
-            })
-            .map_err(to_rpc_error)?;
-
+    fn restore(&self, request: WalletRequest, mnemonic: Mnemonic) -> Result<String> {
         self.client
             .restore_wallet(&request.name, &request.passphrase, &mnemonic)
             .map_err(to_rpc_error)?;
 
-        mnemonic.into_phrase().zeroize();
+        mnemonic.zeroize();
 
         self.client
             .new_staking_address(&request.name, &request.passphrase)
@@ -144,7 +132,7 @@ where
     fn create_staking_address(&self, request: WalletRequest) -> Result<String> {
         self.client
             .new_staking_address(&request.name, &request.passphrase)
-            .map(|extended_addr| extended_addr.to_string())
+            .map(|staked_state_addr| staked_state_addr.to_string())
             .map_err(to_rpc_error)
     }
 
@@ -273,7 +261,6 @@ pub mod tests {
 
     use secstr::SecUtf8;
 
-    use chrono::DateTime;
     use parity_scale_codec::Encode;
 
     use chain_core::init::coin::CoinError;
@@ -282,6 +269,8 @@ pub mod tests {
     use chain_core::tx::fee::{Fee, FeeAlgorithm};
     use chain_core::tx::{PlainTxAux, TransactionId, TxAux, TxObfuscated};
     use client_common::storage::MemoryStorage;
+    use client_common::tendermint::lite;
+    use client_common::tendermint::mock;
     use client_common::tendermint::types::*;
     use client_common::tendermint::Client;
     use client_common::{
@@ -377,27 +366,33 @@ pub mod tests {
 
         fn status(&self) -> CommonResult<Status> {
             Ok(Status {
-                sync_info: SyncInfo {
-                    latest_block_height: "1".to_string(),
-                    latest_app_hash:
-                        "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C"
-                            .to_string(),
+                sync_info: status::SyncInfo {
+                    latest_block_height: Height::default(),
+                    latest_app_hash: Some(
+                        Hash::from_str(
+                            "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C",
+                        )
+                        .unwrap(),
+                    ),
+                    ..mock::sync_info()
                 },
+                ..mock::status_response()
             })
         }
 
         fn block(&self, _height: u64) -> CommonResult<Block> {
             Ok(Block {
-                block: BlockInner {
-                    header: Header {
-                        app_hash:
-                            "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C"
-                                .to_string(),
-                        height: "1".to_string(),
-                        time: DateTime::from_str("2019-04-09T09:38:41.735577Z").unwrap(),
-                    },
-                    data: Data { txs: None },
+                header: Header {
+                    app_hash: Some(
+                        Hash::from_str(
+                            "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C",
+                        )
+                        .unwrap(),
+                    ),
+                    time: Time::from_str("2019-04-09T09:38:41.735577Z").unwrap(),
+                    ..mock::header()
                 },
+                ..mock::block()
             })
         }
 
@@ -406,22 +401,23 @@ pub mod tests {
             _heights: T,
         ) -> CommonResult<Vec<Block>> {
             Ok(vec![Block {
-                block: BlockInner {
-                    header: Header {
-                        app_hash:
-                            "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C"
-                                .to_string(),
-                        height: "1".to_string(),
-                        time: DateTime::from_str("2019-04-09T09:38:41.735577Z").unwrap(),
-                    },
-                    data: Data { txs: None },
+                header: Header {
+                    app_hash: Some(
+                        Hash::from_str(
+                            "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C",
+                        )
+                        .unwrap(),
+                    ),
+                    time: Time::from_str("2019-04-09T09:38:41.735577Z").unwrap(),
+                    ..mock::header()
                 },
+                ..mock::block()
             }])
         }
 
         fn block_results(&self, _height: u64) -> CommonResult<BlockResults> {
             Ok(BlockResults {
-                height: "1".to_string(),
+                height: Height::default(),
                 results: Results {
                     deliver_tx: None,
                     end_block: None,
@@ -434,7 +430,7 @@ pub mod tests {
             _heights: T,
         ) -> CommonResult<Vec<BlockResults>> {
             Ok(vec![BlockResults {
-                height: "1".to_string(),
+                height: Height::default(),
                 results: Results {
                     deliver_tx: None,
                     end_block: None,
@@ -442,11 +438,19 @@ pub mod tests {
             }])
         }
 
-        fn broadcast_transaction(&self, _transaction: &[u8]) -> CommonResult<BroadcastTxResult> {
+        fn block_batch_verified<'a, T: Clone + Iterator<Item = &'a u64>>(
+            &self,
+            _state: lite::TrustedState,
+            _heights: T,
+        ) -> CommonResult<(Vec<Block>, lite::TrustedState)> {
+            unreachable!()
+        }
+
+        fn broadcast_transaction(&self, _transaction: &[u8]) -> CommonResult<BroadcastTxResponse> {
             unreachable!("broadcast_transaction")
         }
 
-        fn query(&self, _path: &str, _data: &[u8]) -> CommonResult<QueryResult> {
+        fn query(&self, _path: &str, _data: &[u8]) -> CommonResult<AbciQuery> {
             unreachable!("query")
         }
     }
@@ -704,7 +708,7 @@ pub mod tests {
         let result=wallet_rpc
             .restore(
                 create_wallet_request("Default", "123456"),
-                SecUtf8::from("online hire print other clock like betray vote hollow bus insect meadow replace two tape worry quality disease cabin girl tree pudding issue radar")
+                Mnemonic::from_secstr(&SecUtf8::from("online hire print other clock like betray vote hollow bus insect meadow replace two tape worry quality disease cabin girl tree pudding issue radar")).unwrap()
             )
             .unwrap();
         assert!("Default" == result);
@@ -717,7 +721,7 @@ pub mod tests {
         let result = wallet_rpc
             .restore(
                 create_wallet_request("Default", "123456"),
-                SecUtf8::from("speed tortoise kiwi forward extend baby acoustic foil coach castle ship purchase unlock base hip erode tag keen present vibrant oyster cotton write fetch")
+                Mnemonic::from_secstr(&SecUtf8::from("speed tortoise kiwi forward extend baby acoustic foil coach castle ship purchase unlock base hip erode tag keen present vibrant oyster cotton write fetch")).unwrap()
             )
             .unwrap();
         assert_eq!("Default", result);

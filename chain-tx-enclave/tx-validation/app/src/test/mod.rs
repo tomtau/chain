@@ -83,11 +83,10 @@ fn get_ecdsa_witness<C: Signing>(
 }
 
 fn get_account(account_address: &RedeemAddress) -> StakedState {
-    StakedState::new_init(
+    StakedState::new_init_unbonded(
         Coin::one(),
-        None,
+        0,
         StakedStateAddress::from(*account_address),
-        &StakedStateDestination::UnbondedFromCustomTime(0),
     )
 }
 
@@ -131,7 +130,7 @@ pub fn test_sealing() {
     match end_b {
         Ok(b) => {
             debug!("request filter in the beginning");
-            assert!(b.iter().all(|x| *x == 0u8), "empty filter");
+            assert!(b.is_none(), "empty filter");
         }
         _ => {
             cleanup(&mut db);
@@ -163,7 +162,7 @@ pub fn test_sealing() {
         witness: witness0.clone(),
         payload: encrypt(
             enclave.geteid(),
-            EncryptionRequest::WithdrawStake(tx0, account.clone(), witness0),
+            EncryptionRequest::WithdrawStake(tx0, Box::new(account.clone()), witness0),
         ),
     };
 
@@ -210,7 +209,7 @@ pub fn test_sealing() {
     match end_b {
         Ok(b) => {
             debug!("request filter after one tx");
-            assert!(b.iter().any(|x| *x != 0u8), "non-empty filter");
+            assert!(b.unwrap().iter().any(|x| *x != 0u8), "non-empty filter");
         }
         _ => {
             cleanup(&mut db);

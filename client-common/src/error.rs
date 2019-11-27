@@ -54,7 +54,11 @@ impl Error {
 impl fmt::Display for Error {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.kind, self.message)
+        write!(
+            f,
+            "{}: {}, origin: {:?}",
+            self.kind, self.message, self.origin
+        )
     }
 }
 
@@ -89,6 +93,8 @@ pub enum ErrorKind {
     StorageError,
     /// Random number generation error
     RngError,
+    /// Encryption error
+    EncryptionError,
     /// Decryption error
     DecryptionError,
     /// Serialization error
@@ -109,6 +115,10 @@ pub enum ErrorKind {
     MultiSigError,
     /// Internal error
     InternalError,
+    /// Validator error
+    ValidationError,
+    /// Block data verify failed
+    VerifyError,
 }
 
 impl fmt::Display for ErrorKind {
@@ -118,6 +128,7 @@ impl fmt::Display for ErrorKind {
             ErrorKind::ConnectionError => write!(f, "Connection error"),
             ErrorKind::StorageError => write!(f, "Storage error"),
             ErrorKind::RngError => write!(f, "Random number generation error"),
+            ErrorKind::EncryptionError => write!(f, "Encryption error"),
             ErrorKind::DecryptionError => write!(f, "Decryption error"),
             ErrorKind::SerializationError => write!(f, "Serialization error"),
             ErrorKind::DeserializationError => write!(f, "Deserialization error"),
@@ -128,6 +139,8 @@ impl fmt::Display for ErrorKind {
             ErrorKind::TendermintRpcError => write!(f, "Tendermint RPC error"),
             ErrorKind::MultiSigError => write!(f, "Multi-sig error"),
             ErrorKind::InternalError => write!(f, "Internal error"),
+            ErrorKind::ValidationError => write!(f, "Validation error"),
+            ErrorKind::VerifyError => write!(f, "Verify error"),
         }
     }
 }

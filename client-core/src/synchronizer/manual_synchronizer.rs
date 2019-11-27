@@ -3,12 +3,12 @@ use std::sync::mpsc::Sender;
 
 use itertools::Itertools;
 use secstr::SecUtf8;
+use tendermint::validator;
 
 use chain_core::state::account::StakedStateAddress;
-use chain_tx_filter::BlockFilter;
-use client_common::tendermint::types::{Block, BlockResults, Status};
-use client_common::tendermint::Client;
-use client_common::{BlockHeader, Result, Storage, Transaction};
+use client_common::tendermint::types::{Block, BlockExt, BlockResults, Status};
+use client_common::tendermint::{lite, Client};
+use client_common::{BlockHeader, Error, ErrorKind, Result, Storage, Transaction};
 
 use crate::service::{GlobalStateService, WalletService, WalletStateService};
 use crate::BlockHandler;
@@ -20,6 +20,8 @@ const DEFAULT_BATCH_SIZE: usize = 20;
 pub enum ProgressReport {
     /// Initial report to send start/finish heights
     Init {
+        /// Name of wallet
+        wallet_name: String,
         /// Block height from which synchronization started
         start_block_height: u64,
         /// Block height at which synchronization will finish
@@ -27,12 +29,15 @@ pub enum ProgressReport {
     },
     /// Report to update progress status
     Update {
+        /// Name of wallet
+        wallet_name: String,
         /// Current synchronized block height
         current_block_height: u64,
     },
 }
 
 /// Synchronizer for transaction index which can be triggered manually
+#[derive(Clone)]
 pub struct ManualSynchronizer<S, C, H>
 where
     S: Storage,
@@ -79,15 +84,17 @@ where
         batch_size: Option<usize>,
         progress_reporter: Option<Sender<ProgressReport>>,
     ) -> Result<()> {
+        let trust_state = self.load_trust_state()?;
         let status = self.client.status()?;
 
         let last_block_height = self
             .global_state_service
             .last_block_height(name, passphrase)?;
-        let current_block_height = status.last_block_height()?;
+        let current_block_height = status.sync_info.latest_block_height.value();
 
         if let Some(ref sender) = &progress_reporter {
             let _ = sender.send(ProgressReport::Init {
+                wallet_name: name.to_owned(),
                 start_block_height: last_block_height,
                 finish_block_height: current_block_height,
             });
@@ -127,7 +134,9 @@ where
             }
 
             // Fetch batch details if it cannot be fast forwarded
-            let blocks = self.client.block_batch(range.iter())?;
+            let (blocks, trust_state) = self
+                .client
+                .block_batch_verified(trust_state.clone(), range.iter())?;
             let block_results = self.client.block_results_batch(range.iter())?;
 
             for (block, block_result) in blocks.into_iter().zip(block_results.into_iter()) {
@@ -147,10 +156,13 @@ where
 
                 if let Some(ref sender) = &progress_reporter {
                     let _ = sender.send(ProgressReport::Update {
-                        current_block_height: block.height()?,
+                        wallet_name: name.to_owned(),
+                        current_block_height: block.header.height.value(),
                     });
                 }
             }
+
+            self.global_state_service.save_trust_state(&trust_state)?;
         }
 
         Ok(())
@@ -182,10 +194,14 @@ where
         progress_reporter: &Option<Sender<ProgressReport>>,
     ) -> Result<bool> {
         let last_app_hash = self.global_state_service.last_app_hash(name, passphrase)?;
-        let current_app_hash = status.last_app_hash();
+        let current_app_hash = status
+            .sync_info
+            .latest_app_hash
+            .ok_or_else(|| Error::from(ErrorKind::TendermintRpcError))?
+            .to_string();
 
         if current_app_hash == last_app_hash {
-            let current_block_height = status.last_block_height()?;
+            let current_block_height = status.sync_info.latest_block_height.value();
 
             let block = self.client.block(current_block_height)?;
             let block_result = self.client.block_results(current_block_height)?;
@@ -195,6 +211,7 @@ where
 
             if let Some(ref sender) = progress_reporter {
                 let _ = sender.send(ProgressReport::Update {
+                    wallet_name: name.to_owned(),
                     current_block_height,
                 });
             }
@@ -215,10 +232,14 @@ where
         progress_reporter: &Option<Sender<ProgressReport>>,
     ) -> Result<bool> {
         let last_app_hash = self.global_state_service.last_app_hash(name, passphrase)?;
-        let current_app_hash = block.app_hash();
+        let current_app_hash = block
+            .header
+            .app_hash
+            .ok_or_else(|| Error::from(ErrorKind::TendermintRpcError))?
+            .to_string();
 
         if current_app_hash == last_app_hash {
-            let current_block_height = block.height()?;
+            let current_block_height = block.header.height.value();
 
             let block_result = self.client.block_results(current_block_height)?;
 
@@ -227,6 +248,7 @@ where
 
             if let Some(ref sender) = progress_reporter {
                 let _ = sender.send(ProgressReport::Update {
+                    wallet_name: name.to_owned(),
                     current_block_height,
                 });
             }
@@ -236,15 +258,26 @@ where
             Ok(false)
         }
     }
+
+    fn load_trust_state(&self) -> Result<lite::TrustedState> {
+        let opt = self.global_state_service.load_trust_state()?;
+        match opt {
+            None => Ok(lite::TrustedState {
+                header: None,
+                validators: validator::Set::new(self.client.genesis()?.validators),
+            }),
+            Some(st) => Ok(st),
+        }
+    }
 }
 
 fn check_unencrypted_transactions(
-    block_filter: &BlockFilter,
+    block_results: &BlockResults,
     staking_addresses: &BTreeSet<StakedStateAddress>,
     block: &Block,
 ) -> Result<Vec<Transaction>> {
     for staking_address in staking_addresses {
-        if block_filter.check_staked_state_address(staking_address) {
+        if block_results.contains_account(&staking_address)? {
             return block.unencrypted_transactions();
         }
     }
@@ -257,15 +290,19 @@ fn prepare_block_header(
     block: &Block,
     block_result: &BlockResults,
 ) -> Result<BlockHeader> {
-    let app_hash = block.app_hash();
-    let block_height = block.height()?;
-    let block_time = block.time();
+    let app_hash = block
+        .header
+        .app_hash
+        .ok_or_else(|| Error::from(ErrorKind::TendermintRpcError))?
+        .to_string();
+    let block_height = block.header.height.value();
+    let block_time = block.header.time;
 
     let transaction_ids = block_result.transaction_ids()?;
     let block_filter = block_result.block_filter()?;
 
     let unencrypted_transactions =
-        check_unencrypted_transactions(&block_filter, staking_addresses, block)?;
+        check_unencrypted_transactions(&block_result, staking_addresses, block)?;
 
     Ok(BlockHeader {
         app_hash,
@@ -284,11 +321,10 @@ mod tests {
     use std::str::FromStr;
 
     use base64::encode;
-    use chrono::DateTime;
     use parity_scale_codec::Encode;
     use secp256k1::recovery::{RecoverableSignature, RecoveryId};
 
-    use chain_core::common::TendermintEventType;
+    use chain_core::common::{TendermintEventKey, TendermintEventType};
     use chain_core::init::address::RedeemAddress;
     use chain_core::init::coin::Coin;
     use chain_core::state::account::{
@@ -296,6 +332,8 @@ mod tests {
     };
     use chain_core::tx::TxAux;
     use client_common::storage::MemoryStorage;
+    use client_common::tendermint::lite;
+    use client_common::tendermint::mock;
     use client_common::tendermint::types::*;
     use client_common::ErrorKind;
 
@@ -349,48 +387,56 @@ mod tests {
 
     impl Client for MockClient {
         fn genesis(&self) -> Result<Genesis> {
-            unreachable!()
+            Ok(mock::genesis())
         }
 
         fn status(&self) -> Result<Status> {
             Ok(Status {
-                sync_info: SyncInfo {
-                    latest_block_height: "2".to_owned(),
-                    latest_app_hash:
-                        "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C"
-                            .to_string(),
+                sync_info: status::SyncInfo {
+                    latest_block_height: Height::default().increment(),
+                    latest_app_hash: Some(
+                        Hash::from_str(
+                            "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C",
+                        )
+                        .unwrap(),
+                    ),
+                    ..mock::sync_info()
                 },
+                ..mock::status_response()
             })
         }
 
         fn block(&self, height: u64) -> Result<Block> {
             if height == 1 {
                 Ok(Block {
-                    block: BlockInner {
-                        header: Header {
-                            app_hash:
-                                "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3D"
-                                    .to_string(),
-                            height: "1".to_owned(),
-                            time: DateTime::from_str("2019-04-09T09:38:41.735577Z").unwrap(),
-                        },
-                        data: Data { txs: None },
+                    header: Header {
+                        app_hash: Some(
+                            Hash::from_str(
+                                "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3D",
+                            )
+                            .unwrap(),
+                        ),
+                        height: height.into(),
+                        time: Time::from_str("2019-04-09T09:38:41.735577Z").unwrap(),
+                        ..mock::header()
                     },
+                    ..mock::block()
                 })
             } else if height == 2 {
                 Ok(Block {
-                    block: BlockInner {
-                        header: Header {
-                            app_hash:
-                                "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C"
-                                    .to_string(),
-                            height: "2".to_owned(),
-                            time: DateTime::from_str("2019-04-10T09:38:41.735577Z").unwrap(),
-                        },
-                        data: Data {
-                            txs: Some(vec![encode(&unbond_transaction().encode())]),
-                        },
+                    header: Header {
+                        app_hash: Some(
+                            Hash::from_str(
+                                "3891040F29C6A56A5E36B17DCA6992D8F91D1EAAB4439D008D19A9D703271D3C",
+                            )
+                            .unwrap(),
+                        ),
+                        height: height.into(),
+                        time: Time::from_str("2019-04-10T09:38:41.735577Z").unwrap(),
+                        ..mock::header()
                     },
+                    data: Data::new(vec![abci::Transaction::new(unbond_transaction().encode())]),
+                    ..mock::block()
                 })
             } else {
                 Err(ErrorKind::InvalidInput.into())
@@ -404,14 +450,14 @@ mod tests {
         fn block_results(&self, height: u64) -> Result<BlockResults> {
             if height == 1 {
                 Ok(BlockResults {
-                    height: "1".to_string(),
+                    height: Height::default(),
                     results: Results {
                         deliver_tx: None,
                         end_block: Some(EndBlock {
                             events: vec![Event {
                                 event_type: TendermintEventType::BlockFilter.to_string(),
                                 attributes: vec![Attribute {
-                                    key: "ethbloom".to_owned(),
+                                    key: TendermintEventKey::EthBloom.to_base64_string(),
                                     value: encode(&[0; 256][..]),
                                 }],
                             }],
@@ -419,33 +465,31 @@ mod tests {
                     },
                 })
             } else if height == 2 {
-                let mut block_filter = BlockFilter::default();
-                block_filter.add_staked_state_address(&self.staking_address);
-
                 Ok(BlockResults {
-                    height: "2".to_string(),
+                    height: Height::default().increment(),
                     results: Results {
                         deliver_tx: Some(vec![DeliverTx {
                             events: vec![Event {
                                 event_type: TendermintEventType::ValidTransactions.to_string(),
-                                attributes: vec![Attribute {
-                                    key: "dHhpZA==".to_owned(),
-                                    value: encode(
-                                        hex::encode(&unbond_transaction().tx_id()).as_bytes(),
-                                    )
-                                    .to_owned(),
-                                }],
+                                attributes: vec![
+                                    Attribute {
+                                        key: TendermintEventKey::TxId.to_base64_string(),
+                                        value: encode(
+                                            hex::encode(&unbond_transaction().tx_id()).as_bytes(),
+                                        )
+                                        .to_owned(),
+                                    },
+                                    Attribute {
+                                        key: TendermintEventKey::Account.to_base64_string(),
+                                        value: encode(&Vec::from(format!(
+                                            "{}",
+                                            &self.staking_address
+                                        ))),
+                                    },
+                                ],
                             }],
                         }]),
-                        end_block: Some(EndBlock {
-                            events: vec![Event {
-                                event_type: TendermintEventType::BlockFilter.to_string(),
-                                attributes: vec![Attribute {
-                                    key: "ethbloom".to_owned(),
-                                    value: encode(&block_filter.get_tendermint_kv().unwrap().1),
-                                }],
-                            }],
-                        }),
+                        end_block: Some(EndBlock { events: Vec::new() }),
                     },
                 })
             } else {
@@ -460,11 +504,19 @@ mod tests {
             heights.map(|height| self.block_results(*height)).collect()
         }
 
-        fn broadcast_transaction(&self, _transaction: &[u8]) -> Result<BroadcastTxResult> {
+        fn block_batch_verified<'a, T: Clone + Iterator<Item = &'a u64>>(
+            &self,
+            state: lite::TrustedState,
+            heights: T,
+        ) -> Result<(Vec<Block>, lite::TrustedState)> {
+            Ok((self.block_batch(heights)?, state))
+        }
+
+        fn broadcast_transaction(&self, _transaction: &[u8]) -> Result<BroadcastTxResponse> {
             unreachable!()
         }
 
-        fn query(&self, _path: &str, _data: &[u8]) -> Result<QueryResult> {
+        fn query(&self, _path: &str, _data: &[u8]) -> Result<AbciQuery> {
             unreachable!()
         }
     }

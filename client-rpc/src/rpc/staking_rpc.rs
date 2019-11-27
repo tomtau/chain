@@ -4,12 +4,15 @@ use jsonrpc_core::Result;
 use jsonrpc_derive::rpc;
 
 use chain_core::init::coin::Coin;
-use chain_core::state::account::{StakedState, StakedStateAddress, StakedStateOpAttributes};
+use chain_core::state::account::{
+    CouncilNode, StakedState, StakedStateAddress, StakedStateOpAttributes,
+};
+use chain_core::state::tendermint::TendermintValidatorPubKey;
 use chain_core::tx::data::access::{TxAccess, TxAccessPolicy};
 use chain_core::tx::data::address::ExtendedAddr;
 use chain_core::tx::data::attribute::TxAttributes;
 use chain_core::tx::data::input::TxoPointer;
-use client_common::{ErrorKind, PublicKey, Result as CommonResult, ResultExt};
+use client_common::{Error, ErrorKind, PublicKey, Result as CommonResult, ResultExt};
 use client_core::{MultiSigWalletClient, WalletClient};
 use client_network::NetworkOpsClient;
 
@@ -43,6 +46,18 @@ pub trait StakingRpc: Send + Sync {
         from_address: String,
         to_address: String,
         view_keys: Vec<String>,
+    ) -> Result<String>;
+
+    #[rpc(name = "staking_unjail")]
+    fn unjail(&self, request: WalletRequest, unjail_address: String) -> Result<String>;
+
+    #[rpc(name = "staking_validatorNodeJoin")]
+    fn node_join(
+        &self,
+        request: WalletRequest,
+        validator_node_name: String,
+        validator_pubkey: String,
+        staking_address: String,
     ) -> Result<String>;
 }
 
@@ -210,4 +225,96 @@ where
 
         Ok(hex::encode(transaction.tx_id()))
     }
+
+    fn unjail(&self, request: WalletRequest, unjail_address: String) -> Result<String> {
+        let unjail_address = StakedStateAddress::from_str(&unjail_address)
+            .chain(|| {
+                (
+                    ErrorKind::DeserializationError,
+                    format!("Unable to deserialize unjail_address ({})", unjail_address),
+                )
+            })
+            .map_err(to_rpc_error)?;
+
+        let attributes = StakedStateOpAttributes::new(self.network_id);
+
+        let transaction = self
+            .ops_client
+            .create_unjail_transaction(
+                &request.name,
+                &request.passphrase,
+                unjail_address,
+                attributes,
+            )
+            .map_err(to_rpc_error)?;
+
+        self.client
+            .broadcast_transaction(&transaction)
+            .map_err(to_rpc_error)?;
+
+        Ok(hex::encode(transaction.tx_id()))
+    }
+
+    fn node_join(
+        &self,
+        request: WalletRequest,
+        validator_node_name: String,
+        validator_pubkey: String,
+        staking_addr: String,
+    ) -> Result<String> {
+        let attributes = StakedStateOpAttributes::new(self.network_id);
+        let staking_account_address = staking_addr
+            .parse::<StakedStateAddress>()
+            .chain(|| {
+                (
+                    ErrorKind::DeserializationError,
+                    "Unable to deserialize staking address",
+                )
+            })
+            .map_err(to_rpc_error)?;
+        let node_metadata = get_node_metadata(&validator_node_name, &validator_pubkey)?;
+        let transaction = self
+            .ops_client
+            .create_node_join_transaction(
+                &request.name,
+                &request.passphrase,
+                staking_account_address,
+                attributes,
+                node_metadata,
+            )
+            .map_err(to_rpc_error)?;
+        self.client
+            .broadcast_transaction(&transaction)
+            .map_err(to_rpc_error)?;
+
+        Ok(hex::encode(transaction.tx_id()))
+    }
+}
+
+fn get_node_metadata(validator_name: &str, validator_pubkey: &str) -> Result<CouncilNode> {
+    let decoded_pubkey = base64::decode(validator_pubkey)
+        .chain(|| {
+            (
+                ErrorKind::DeserializationError,
+                "Unable to decode base64 encoded bytes of validator pubkey",
+            )
+        })
+        .map_err(to_rpc_error)?;
+
+    if decoded_pubkey.len() != 32 {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "Expected validator pubkey of 32 bytes",
+        ))
+        .map_err(to_rpc_error);
+    }
+
+    let mut pubkey_bytes = [0; 32];
+    pubkey_bytes.copy_from_slice(&decoded_pubkey);
+
+    Ok(CouncilNode {
+        name: validator_name.to_string(),
+        security_contact: None,
+        consensus_pubkey: TendermintValidatorPubKey::Ed25519(pubkey_bytes),
+    })
 }

@@ -1,5 +1,6 @@
 mod app_init;
 mod commit;
+mod end_block;
 mod jail_account;
 mod query;
 mod slash_accounts;
@@ -8,26 +9,22 @@ mod validate_tx;
 use abci::*;
 use log::info;
 
-pub use self::app_init::{ChainNodeApp, ChainNodeState};
+pub use self::app_init::{
+    get_validator_key, init_app_hash, ChainNodeApp, ChainNodeState, ValidatorState,
+};
 use crate::enclave_bridge::EnclaveProxy;
-use crate::liveness::LivenessTracker;
 use crate::slashing::SlashingSchedule;
 use crate::storage::account::AccountStorage;
 use crate::storage::account::AccountWrapper;
 use crate::storage::tx::StarlingFixedKey;
 use crate::storage::COL_TX_META;
 use bit_vec::BitVec;
-use chain_core::common::TendermintEventType;
-use chain_core::state::account::StakedState;
-use chain_core::state::tendermint::{
-    BlockHeight, TendermintValidatorAddress, TendermintValidatorPubKey, TendermintVotePower,
-};
+use chain_core::common::{TendermintEventKey, TendermintEventType};
+use chain_core::state::account::{PunishmentKind, StakedState};
+use chain_core::state::tendermint::{BlockHeight, TendermintValidatorAddress, TendermintVotePower};
 use chain_core::tx::data::input::TxoPointer;
 use chain_core::tx::{TxAux, TxEnclaveAux};
-use chain_tx_filter::BlockFilter;
-use enclave_protocol::{EnclaveRequest, EnclaveResponse};
 use kvdb::{DBTransaction, KeyValueDB};
-use protobuf::RepeatedField;
 use std::collections::BTreeMap;
 use std::convert::{TryFrom, TryInto};
 use std::sync::Arc;
@@ -137,7 +134,7 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
             .as_mut()
             .expect("executing begin block, but no app state stored (i.e. no initchain or recovery was executed)");
 
-        last_state.block_time = block_time;
+        last_state.block_time = block_time.try_into().expect("invalid block time");
 
         if block_height > 1 {
             if let Some(last_commit_info) = req.last_commit_info.as_ref() {
@@ -158,16 +155,17 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
                 let validator_address =
                     TendermintValidatorAddress::try_from(validator.address.as_slice())
                         .expect("Invalid validator address in begin block request");
-                let account_address = last_state
-                    .punishment
-                    .validator_liveness
+
+                let account_address = *last_state
+                    .validators
+                    .tendermint_validator_addresses
                     .get(&validator_address)
-                    .expect("Validator not found in liveness tracker")
-                    .address();
+                    .expect("Staking account address not found for tendermint validator address");
 
                 accounts_to_punish.push((
                     account_address,
                     last_state.network_params.get_byzantine_slash_percent(),
+                    PunishmentKind::ByzantineFault,
                 ))
             }
         }
@@ -176,14 +174,19 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
 
         accounts_to_punish.extend(
             last_state
+                .validators
                 .punishment
                 .validator_liveness
-                .values()
-                .filter(|tracker| !tracker.is_live(missed_block_threshold))
-                .map(|liveness_tracker| {
+                // FIXME: liveness tracking should mark that on each update, so this could be returned directly
+                // rather than re-iterated through on every block
+                .iter()
+                .filter(|(_, tracker)| !tracker.is_live(missed_block_threshold))
+                .map(|(tendermint_validator_address, _)| {
                     (
-                        liveness_tracker.address(),
+                        *last_state.validators.tendermint_validator_addresses.get(tendermint_validator_address)
+                            .expect("Staking account address for tendermint validator address not found"),
                         last_state.network_params.get_liveness_slash_percent(),
+                        PunishmentKind::NonLive,
                     )
                 }),
         );
@@ -201,33 +204,38 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
             .as_mut()
             .expect("executing begin block, but no app state stored (i.e. no initchain or recovery was executed)");
 
-        for (account_address, slash_ratio) in accounts_to_punish.iter() {
+        for (account_address, slash_ratio, punishment_kind) in accounts_to_punish.iter() {
             match last_state
+                .validators
                 .punishment
                 .slashing_schedule
                 .get_mut(&account_address)
             {
                 Some(account_slashing_schedule) => {
                     account_slashing_schedule
-                        .update_slash_ratio((*slash_ratio) * slashing_proportion);
+                        .update_slash_ratio((*slash_ratio) * slashing_proportion, *punishment_kind);
                 }
                 None => {
-                    last_state.punishment.slashing_schedule.insert(
+                    last_state.validators.punishment.slashing_schedule.insert(
                         *account_address,
-                        SlashingSchedule::new((*slash_ratio) * slashing_proportion, slashing_time),
+                        SlashingSchedule::new(
+                            (*slash_ratio) * slashing_proportion,
+                            slashing_time,
+                            *punishment_kind,
+                        ),
                     );
                 }
             }
         }
 
-        for (account_address, _) in accounts_to_punish {
+        for (account_address, _, punishment_kind) in accounts_to_punish {
             let mut kvpair = KVPair::new();
-            kvpair.key = b"account".to_vec();
+            kvpair.key = TendermintEventKey::Account.into();
             kvpair.value = account_address.to_string().into_bytes();
 
             jailing_event.attributes.push(kvpair);
 
-            self.jail_account(account_address)
+            self.jail_account(account_address, punishment_kind)
                 .expect("Unable to jail account in begin block");
         }
 
@@ -292,24 +300,44 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
                     &self.uncommitted_account_root_hash,
                     &mut self.accounts,
                 ),
+                TxAux::NodeJoinTx(_, _) => {
+                    let state = fee_acc
+                        .1
+                        .expect("staked state returned in node join verification");
+                    self.new_nodes_in_block.insert(
+                        state.address,
+                        state
+                            .council_node
+                            .clone()
+                            .expect("state after nodejointx should have council node"),
+                    );
+                    let power = TendermintVotePower::from(state.bonded);
+                    self.power_changed_in_block.insert(state.address, power);
+                    update_account(
+                        state,
+                        &self.uncommitted_account_root_hash,
+                        &mut self.accounts,
+                    )
+                }
             };
             let mut event = Event::new();
             event.field_type = TendermintEventType::ValidTransactions.to_string();
             let mut kvpair_fee = KVPair::new();
-            kvpair_fee.key = Vec::from(&b"fee"[..]);
+            kvpair_fee.key = TendermintEventKey::Fee.into();
             kvpair_fee.value = Vec::from(format!("{}", fee_acc.0.to_coin()));
             event.attributes.push(kvpair_fee);
 
             if let Some(ref account) = maccount {
-                // FIXME: no need to add to the filter / maintain this filter in abci
-                self.filter.add_staked_state_address(&account.address);
                 let mut kvpair = KVPair::new();
-                kvpair.key = Vec::from(&b"account"[..]);
+                kvpair.key = TendermintEventKey::Account.into();
                 kvpair.value = Vec::from(format!("{}", &account.address));
                 event.attributes.push(kvpair);
             }
             match maccount {
-                Some(ref account) if self.validator_voting_power.contains_key(&account.address) => {
+                Some(ref account)
+                    if (self.validator_voting_power.contains_key(&account.address)
+                        || self.power_changed_in_block.contains_key(&account.address)) =>
+                {
                     if account.is_jailed() {
                         log::error!("Validation should not be successful for jailed accounts");
                         unreachable!("Validation should not be successful for jailed accounts");
@@ -322,7 +350,11 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
                                 .get_required_council_node_stake(),
                         );
                         let new_power = TendermintVotePower::from(account.bonded);
-                        let old_power = self.validator_voting_power[&account.address];
+                        let old_power = self
+                            .validator_voting_power
+                            .get(&account.address)
+                            .copied()
+                            .unwrap_or_else(TendermintVotePower::zero);
                         if new_power > old_power && new_power >= min_power {
                             self.power_changed_in_block
                                 .insert(account.address, new_power);
@@ -344,7 +376,7 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
             // TODO: most of these intermediate uncommitted tree roots aren't useful (not exposed for querying) -- prune them / the account storage?
             self.uncommitted_account_root_hash = next_account_root;
             let mut kvpair = KVPair::new();
-            kvpair.key = Vec::from(&b"txid"[..]);
+            kvpair.key = TendermintEventKey::TxId.into();
             kvpair.value = Vec::from(hex::encode(txaux.tx_id()).as_bytes());
             event.attributes.push(kvpair);
             resp.events.push(event);
@@ -365,75 +397,10 @@ impl<T: EnclaveProxy> abci::Application for ChainNodeApp<T> {
         resp
     }
 
-    /// Consensus Connection: Called at the end of the block.  Often used to update the validator set.
+    /// Consensus Connection: Called at the end of the block. used to update the validator set.
     fn end_block(&mut self, _req: &RequestEndBlock) -> ResponseEndBlock {
         info!("received endblock request");
-        let mut resp = ResponseEndBlock::new();
-        if !self.delivered_txs.is_empty() {
-            let end_block_resp = self.tx_validator.process_request(EnclaveRequest::EndBlock);
-            if let EnclaveResponse::EndBlock(Ok(raw_filter)) = end_block_resp {
-                let filter = BlockFilter::from(&*raw_filter);
-                self.filter.add_filter(&filter);
-            } else {
-                panic!("end block request to obtain the block filter failed");
-            }
-        }
-        if let Some((key, value)) = self.filter.get_tendermint_kv() {
-            let mut kvpair = KVPair::new();
-            kvpair.key = key;
-            kvpair.value = value;
-            let mut event = Event::new();
-            event.field_type = TendermintEventType::BlockFilter.to_string();
-            event.attributes.push(kvpair);
-            resp.events.push(event);
-        }
-        self.filter.reset();
-        // TODO: skipchain-based validator changes?
-        if !self.power_changed_in_block.is_empty() {
-            let mut validators = Vec::with_capacity(self.power_changed_in_block.len());
-            for (address, new_power) in self.power_changed_in_block.iter() {
-                let old_power = self.validator_voting_power[&address];
-                // sanity check, as multiple transactions/events may have cancelled out the vote power change
-                if old_power != *new_power {
-                    let mut validator = ValidatorUpdate::default();
-                    validator.set_power(i64::from(*new_power));
-                    validator.set_pub_key(self.validator_pubkeys[&address].clone());
-                    validators.push(validator);
-
-                    let last_state = self
-                        .last_state
-                        .as_mut()
-                        .expect("Last app state not found, init chain was not called");
-
-                    let validator_liveness = &mut last_state.punishment.validator_liveness;
-
-                    let validator_address: TendermintValidatorAddress =
-                        into_tendermint_validator_pub_key(&self.validator_pubkeys[&address]).into();
-
-                    let new_vote_power: i64 = (*new_power).into();
-
-                    if new_vote_power == 0 && validator_liveness.contains_key(&validator_address) {
-                        validator_liveness.remove(&validator_address);
-                    } else if new_vote_power != 0
-                        && !validator_liveness.contains_key(&validator_address)
-                    {
-                        validator_liveness.insert(
-                            validator_address,
-                            LivenessTracker::new(
-                                *address,
-                                last_state.network_params.get_block_signing_window(),
-                            ),
-                        );
-                    }
-                }
-                self.validator_voting_power.insert(*address, *new_power);
-            }
-            resp.set_validator_updates(RepeatedField::from(validators));
-            self.power_changed_in_block.clear();
-        }
-        self.last_state.as_mut().map(|mut x| x.last_block_height = _req.height)
-            .expect("executing end block, but no app state stored (i.e. no initchain or recovery was executed)");
-        resp
+        ChainNodeApp::end_block_handler(self, _req)
     }
 
     /// Consensus Connection: Commit the block with the latest state from the application.
@@ -467,7 +434,12 @@ fn update_validator_liveness(
             signed
         );
 
-        match state.punishment.validator_liveness.get_mut(&address) {
+        match state
+            .validators
+            .punishment
+            .validator_liveness
+            .get_mut(&address)
+        {
             Some(liveness_tracker) => {
                 liveness_tracker.update(block_height, signed);
             }
@@ -476,20 +448,4 @@ fn update_validator_liveness(
             }
         }
     }
-}
-
-/// Converts `abci::PubKey` into `TendermintValidatorPubKey`
-pub fn into_tendermint_validator_pub_key(pubkey: &PubKey) -> TendermintValidatorPubKey {
-    if pubkey.field_type != "ed25519" {
-        panic!("Received invalid pubkey type");
-    }
-
-    if pubkey.data.len() != 32 {
-        panic!("Reviced pubkey of invalid length");
-    }
-
-    let mut bytes = [0; 32];
-    bytes.copy_from_slice(&pubkey.data);
-
-    TendermintValidatorPubKey::Ed25519(bytes)
 }

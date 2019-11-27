@@ -3,10 +3,14 @@ use crate::init::address::RedeemAddress;
 use crate::init::coin::{sum_coins, Coin, CoinError};
 pub use crate::init::params::*;
 use crate::init::MAX_COIN;
-use crate::state::account::{StakedState, StakedStateAddress, StakedStateDestination};
+use crate::state::account::{
+    CouncilNode, StakedState, StakedStateAddress, StakedStateDestination, ValidatorName,
+    ValidatorSecurityContact,
+};
 use crate::state::tendermint::{TendermintValidatorPubKey, TendermintVotePower};
-use crate::state::CouncilNode;
 use crate::state::RewardsPoolState;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
@@ -21,6 +25,7 @@ pub enum DistributionError {
     InvalidValidatorAccount,
     NoValidators,
     InvalidVotingPower,
+    InvalidPunishmentConfiguration,
 }
 
 impl fmt::Display for DistributionError {
@@ -54,9 +59,35 @@ impl fmt::Display for DistributionError {
             DistributionError::InvalidVotingPower => {
                 write!(f, "Invalid voting power")
             },
+            DistributionError::InvalidPunishmentConfiguration => {
+                write!(f, "Invalid punishment configuration (maybe slash_wait_period >= jail_duration)")
+            }
         }
     }
 }
+
+/// Initial configuration ("app_state" in genesis.json of Tendermint config)
+/// TODO: reward/treasury config, extra validator config...
+#[derive(Debug, PartialEq, Eq, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct InitConfig {
+    // initial rewards pool of CRO tokens
+    pub rewards_pool: Coin,
+    // Redeem mapping of ERC20 snapshot: Eth address => (StakedStateDestination,CRO tokens)
+    // (doesn't include the rewards pool amount)
+    pub distribution: BTreeMap<RedeemAddress, (StakedStateDestination, Coin)>,
+    // initial network parameters
+    pub network_params: InitNetworkParameters,
+    // initial validators
+    pub council_nodes:
+        BTreeMap<RedeemAddress, (ValidatorName, ValidatorSecurityContact, ValidatorPubkey)>,
+}
+
+pub type GenesisState = (
+    Vec<StakedState>,
+    RewardsPoolState,
+    Vec<(StakedStateAddress, CouncilNode)>,
+);
 
 impl InitConfig {
     /// creates a new config (mainly for testing / tools)
@@ -64,7 +95,10 @@ impl InitConfig {
         rewards_pool: Coin,
         owners: BTreeMap<RedeemAddress, (StakedStateDestination, Coin)>,
         network_params: InitNetworkParameters,
-        council_nodes: BTreeMap<RedeemAddress, ValidatorPubkey>,
+        council_nodes: BTreeMap<
+            RedeemAddress,
+            (ValidatorName, ValidatorSecurityContact, ValidatorPubkey),
+        >,
     ) -> Self {
         InitConfig {
             rewards_pool,
@@ -77,7 +111,7 @@ impl InitConfig {
     fn check_validator_address(&self, address: &RedeemAddress) -> Result<(), DistributionError> {
         let expected = self.network_params.required_council_node_stake;
         match self.distribution.get(address) {
-            Some((d, c)) if *d == StakedStateDestination::Bonded && *c == expected => Ok(()),
+            Some((d, c)) if *d == StakedStateDestination::Bonded && *c >= expected => Ok(()),
             Some((_, c)) => Err(DistributionError::DoesNotMatchRequiredAmount(*address, *c)),
             None => Err(DistributionError::AddressNotInDistribution(*address)),
         }
@@ -107,15 +141,44 @@ impl InitConfig {
     fn get_account(&self, genesis_time: Timespec) -> Vec<StakedState> {
         self.distribution
             .iter()
-            .map(|(address, (destination, amount))| {
-                StakedState::new_init(
+            .map(|(address, (destination, amount))| match destination {
+                StakedStateDestination::Bonded => {
+                    let council_node = self.get_council_node(address);
+                    StakedState::new_init_bonded(
+                        *amount,
+                        genesis_time,
+                        StakedStateAddress::BasicRedeem(*address),
+                        council_node.ok(),
+                    )
+                }
+                StakedStateDestination::UnbondedFromGenesis => StakedState::new_init_unbonded(
                     *amount,
-                    Some(genesis_time),
+                    genesis_time,
                     StakedStateAddress::BasicRedeem(*address),
-                    destination,
-                )
+                ),
+                StakedStateDestination::UnbondedFromCustomTime(time) => {
+                    StakedState::new_init_unbonded(
+                        *amount,
+                        *time,
+                        StakedStateAddress::BasicRedeem(*address),
+                    )
+                }
             })
             .collect()
+    }
+
+    fn get_council_node(&self, address: &RedeemAddress) -> Result<CouncilNode, DistributionError> {
+        self.check_validator_address(address)?;
+        let (name, security_contact, key) = self
+            .council_nodes
+            .get(address)
+            .ok_or(DistributionError::InvalidValidatorAccount)?;
+        let validator_key = self.check_validator_key(key)?;
+        Ok(CouncilNode::new_with_details(
+            name.clone(),
+            security_contact.clone(),
+            validator_key,
+        ))
     }
 
     /// checks if the config is valid:
@@ -126,7 +189,7 @@ impl InitConfig {
     pub fn validate_config_get_genesis(
         &self,
         genesis_time: Timespec,
-    ) -> Result<(Vec<StakedState>, RewardsPoolState, Vec<CouncilNode>), DistributionError> {
+    ) -> Result<GenesisState, DistributionError> {
         if self.council_nodes.is_empty() {
             return Err(DistributionError::NoValidators);
         }
@@ -134,22 +197,18 @@ impl InitConfig {
         let pub_keys: HashSet<String> = self
             .council_nodes
             .iter()
-            .map(|(_, pubkey)| pubkey.consensus_pubkey_b64.clone())
+            .map(|(_, details)| details.2.consensus_pubkey_b64.clone())
             .collect();
         if pub_keys.len() != self.council_nodes.len() {
             return Err(DistributionError::DuplicateValidatorKey);
         }
 
-        let validators: Result<Vec<CouncilNode>, DistributionError> = self
+        let validators: Result<Vec<(StakedStateAddress, CouncilNode)>, DistributionError> = self
             .council_nodes
-            .iter()
-            .map(|(address, pubkey)| {
-                self.check_validator_address(address)?;
-                let validator_key = self.check_validator_key(pubkey)?;
-                Ok(CouncilNode::new(
-                    StakedStateAddress::BasicRedeem(*address),
-                    validator_key,
-                ))
+            .keys()
+            .map(|address| {
+                let council_node = self.get_council_node(address)?;
+                Ok((StakedStateAddress::BasicRedeem(*address), council_node))
             })
             .collect();
         Coin::new(
@@ -177,6 +236,12 @@ impl InitConfig {
             Err(e) => {
                 return Err(DistributionError::DistributionCoinError(e));
             }
+        }
+
+        if self.network_params.slashing_config.slash_wait_period
+            >= self.network_params.jailing_config.jail_duration
+        {
+            return Err(DistributionError::InvalidPunishmentConfiguration);
         }
 
         let accounts = self.get_account(genesis_time);

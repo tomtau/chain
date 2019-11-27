@@ -187,10 +187,13 @@ DEV_CONF=$(cat << EOF
         "per_byte_fee": "{PER_BYTE_FEE}"
     },
     "council_nodes": {
-        "0x3ae55c16800dc4bd0e3397a9d7806fb1f11639de": {
+        "0x3ae55c16800dc4bd0e3397a9d7806fb1f11639de": [
+            "integration test",
+            "security@integration.test",
+        {
             "consensus_pubkey_type": "Ed25519",
             "consensus_pubkey_b64": "{PUB_KEY}"
-        }
+        }]
     },
     "genesis_time": "{GENESIS_TIME}"
 }
@@ -209,6 +212,8 @@ function generate_tendermint_genesis() {
     _change_tenermint_chain_id "${RET_VALUE}" "${3}"
 
     echo "${RET_VALUE}" > "${2}/config/genesis.json"
+
+    python fix_genesis.py "${2}/config/genesis.json"
 
     sync
 }
@@ -239,7 +244,7 @@ function _change_tenermint_chain_id() {
 }
 
 # Always execute at script located directory
-cd "$(dirname "${0}")"
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 # Source constants
 . ./const-env.sh
@@ -254,6 +259,9 @@ fi
 if [ -z "${USE_DOCKER_COMPOSE}" ]; then
     check_command_exist "cargo"
 fi
+
+# Allow current user to access docker data directory as owner
+chmod ug+s ./docker-data
 
 print_step "Build Chain image"
 if [ ! -z "${USE_DOCKER_COMPOSE}" ]; then

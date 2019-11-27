@@ -3,6 +3,7 @@ use abci::*;
 use bit_vec::BitVec;
 use chain_abci::app::*;
 use chain_abci::enclave_bridge::mock::MockClient;
+use chain_abci::punishment::ValidatorPunishment;
 use chain_abci::storage::account::AccountStorage;
 use chain_abci::storage::account::AccountWrapper;
 use chain_abci::storage::tx::StarlingFixedKey;
@@ -18,10 +19,12 @@ use chain_core::init::config::{
     JailingParameters, SlashRatio, SlashingParameters, ValidatorKeyType, ValidatorPubkey,
 };
 use chain_core::state::account::{
-    to_stake_key, DepositBondTx, StakedState, StakedStateAddress, StakedStateDestination,
-    StakedStateOpAttributes, StakedStateOpWitness, UnbondTx, WithdrawUnbondedTx,
+    to_stake_key, CouncilNode, DepositBondTx, StakedState, StakedStateAddress,
+    StakedStateDestination, StakedStateOpAttributes, StakedStateOpWitness, UnbondTx,
+    WithdrawUnbondedTx,
 };
-use chain_core::state::tendermint::TendermintVotePower;
+use chain_core::state::tendermint::{TendermintValidatorPubKey, TendermintVotePower};
+use chain_core::state::validator::NodeJoinRequestTx;
 use chain_core::state::RewardsPoolState;
 use chain_core::tx::fee::{LinearFee, Milli};
 use chain_core::tx::witness::tree::RawPubkey;
@@ -51,10 +54,11 @@ use secp256k1::schnorrsig::schnorr_sign;
 use secp256k1::{key::PublicKey, key::SecretKey, Message, Secp256k1, Signing};
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
+use std::convert::TryInto;
 use std::str::FromStr;
 use std::sync::Arc;
 
-fn get_enclave_bridge_mock() -> MockClient {
+pub fn get_enclave_bridge_mock() -> MockClient {
     MockClient::new(0)
 }
 
@@ -64,8 +68,7 @@ pub fn get_ecdsa_witness<C: Signing>(
     secret_key: &SecretKey,
 ) -> EcdsaSignature {
     let message = Message::from_slice(&txid[..]).expect("32 bytes");
-    let sig = secp.sign_recoverable(&message, &secret_key);
-    return sig;
+    secp.sign_recoverable(&message, &secret_key)
 }
 
 fn create_db() -> Arc<dyn KeyValueDB> {
@@ -162,6 +165,7 @@ fn get_dummy_network_params() -> NetworkParameters {
             byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
             slash_wait_period: 10800,
         },
+        max_validators: 1,
     })
 }
 
@@ -172,9 +176,15 @@ fn get_dummy_app_state(app_hash: H256) -> ChainNodeState {
         block_time: 0,
         rewards_pool: RewardsPoolState::new(1.into(), 0),
         last_account_root_hash: [0u8; 32],
-        council_nodes: vec![],
         network_params: get_dummy_network_params(),
-        punishment: Default::default(),
+        validators: ValidatorState {
+            council_nodes_by_power: BTreeMap::new(),
+            tendermint_validator_addresses: BTreeMap::new(),
+            punishment: ValidatorPunishment {
+                validator_liveness: BTreeMap::new(),
+                slashing_schedule: Default::default(),
+            },
+        },
     }
 }
 
@@ -240,16 +250,32 @@ fn init_chain_for(address: RedeemAddress) -> ChainNodeApp<MockClient> {
             byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
             slash_wait_period: 10800,
         },
+        max_validators: 1,
     };
     let mut nodes = BTreeMap::new();
-    let node_pubkey = ValidatorPubkey {
-        consensus_pubkey_type: ValidatorKeyType::Ed25519,
-        consensus_pubkey_b64: "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=".to_string(),
+    let pub_key_base64 = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=";
+    let node_pubkey = (
+        "test".to_owned(),
+        None,
+        ValidatorPubkey {
+            consensus_pubkey_type: ValidatorKeyType::Ed25519,
+            consensus_pubkey_b64: pub_key_base64.to_string(),
+        },
+    );
+    let validator = ValidatorUpdate {
+        pub_key: Some(PubKey {
+            field_type: "ed25519".to_owned(),
+            data: base64::decode(&pub_key_base64).unwrap(),
+            ..Default::default()
+        })
+        .into(),
+        power: TendermintVotePower::from(Coin::unit()).into(),
+        ..Default::default()
     };
     nodes.insert(validator_addr, node_pubkey);
     let c = InitConfig::new(rewards_pool, distribution, params, nodes);
     let t = ::protobuf::well_known_types::Timestamp::new();
-    let result = c.validate_config_get_genesis(t.get_seconds());
+    let result = c.validate_config_get_genesis(t.get_seconds().try_into().unwrap());
     if let Ok((accounts, rp, _nodes)) = result {
         let tx_tree = MerkleTree::empty();
         let mut account_tree =
@@ -283,6 +309,7 @@ fn init_chain_for(address: RedeemAddress) -> ChainNodeApp<MockClient> {
         req.set_time(t);
         req.set_app_state_bytes(serde_json::to_vec(&c).unwrap());
         req.set_chain_id(String::from(TEST_CHAIN_ID));
+        req.set_validators(vec![validator].into());
         app.init_chain(&req);
         app
     } else {
@@ -348,6 +375,7 @@ fn init_chain_panics_with_different_app_hash() {
             byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
             slash_wait_period: 10800,
         },
+        max_validators: 1,
     };
     let c = InitConfig::new(rewards_pool, distribution, params, BTreeMap::new());
 
@@ -804,7 +832,7 @@ fn block_commit(app: &mut ChainNodeApp<MockClient>, tx: TxAux, block_height: i64
     println!("commit: {:?}", app.commit(&RequestCommit::default()));
 }
 
-fn get_account(account_address: &RedeemAddress, app: &ChainNodeApp<MockClient>) -> StakedState {
+pub fn get_account(account_address: &RedeemAddress, app: &ChainNodeApp<MockClient>) -> StakedState {
     println!(
         "uncommitted root hash: {}",
         hex::encode(app.uncommitted_account_root_hash)
@@ -845,7 +873,7 @@ fn all_valid_tx_types_should_commit() {
         0,
         vec![
             TxOut::new_with_timelock(eaddr.clone(), Coin::one(), 0),
-            TxOut::new_with_timelock(eaddr.clone(), Coin::one(), 0),
+            TxOut::new_with_timelock(eaddr.clone(), (Coin::one() + Coin::one()).unwrap(), 0),
         ],
         TxAttributes::new_with_access(
             0,
@@ -948,870 +976,62 @@ fn all_valid_tx_types_should_commit() {
         assert_eq!(account.nonce, 2);
     }
 
-    let tx3 = UnbondTx::new(addr.into(), 2, halfcoin, StakedStateOpAttributes::new(0));
-    let witness3 = StakedStateOpWitness::new(get_ecdsa_witness(&secp, &tx3.id(), &secret_key));
-    let unbondtx = TxAux::UnbondStakeTx(tx3, witness3);
+    let tx = NodeJoinRequestTx::new(
+        2,
+        addr.into(),
+        StakedStateOpAttributes::new(0),
+        CouncilNode::new(TendermintValidatorPubKey::Ed25519([2u8; 32])),
+    );
+    let secp = Secp256k1::new();
+    let witness = StakedStateOpWitness::new(get_ecdsa_witness(&secp, &tx.id(), &secret_key));
+    let nodejointx = TxAux::NodeJoinTx(tx, witness);
+    {
+        let account = get_account(&addr, &app);
+        assert!(account.council_node.is_none());
+        assert_eq!(
+            app.last_state
+                .as_ref()
+                .unwrap()
+                .validators
+                .council_nodes_by_power
+                .len(),
+            1
+        );
+        assert_eq!(account.nonce, 2);
+    }
+    block_commit(&mut app, nodejointx, 4);
+    {
+        let account = get_account(&addr, &app);
+        assert!(account.council_node.is_some());
+        assert_eq!(
+            app.last_state
+                .as_ref()
+                .unwrap()
+                .validators
+                .council_nodes_by_power
+                .len(),
+            2
+        );
+        assert_eq!(account.nonce, 3);
+    }
+
+    let tx4 = UnbondTx::new(
+        addr.into(),
+        3,
+        Coin::unit(),
+        StakedStateOpAttributes::new(0),
+    );
+    let witness4 = StakedStateOpWitness::new(get_ecdsa_witness(&secp, &tx4.id(), &secret_key));
+    let unbondtx = TxAux::UnbondStakeTx(tx4, witness4);
     {
         let account = get_account(&addr, &app);
         assert_eq!(account.unbonded, Coin::zero());
-        assert_eq!(account.nonce, 2);
-    }
-    block_commit(&mut app, unbondtx, 4);
-    {
-        let account = get_account(&addr, &app);
-        // TODO: more precise amount assertions
-        assert!(account.unbonded > Coin::zero());
         assert_eq!(account.nonce, 3);
     }
-}
-
-#[test]
-fn end_block_should_update_liveness_tracker() {
-    use chain_abci::app::into_tendermint_validator_pub_key;
-    use chain_core::state::tendermint::TendermintValidatorAddress;
-    use protobuf::well_known_types::Timestamp;
-
-    let storage = Storage::new_db(create_db());
-    let mut account_storage =
-        AccountStorage::new(Storage::new_db(Arc::new(create(1))), 20).expect("account db");
-
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("32 bytes, within curve order");
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-    let address = RedeemAddress::from(&public_key);
-    let staking_account_address = StakedStateAddress::BasicRedeem(address);
-
-    let mut validator_pubkey = PubKey::new();
-    validator_pubkey.field_type = "Ed25519".to_string();
-    validator_pubkey.data = base64::decode("EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=").unwrap();
-
-    let mut validator_voting_power = BTreeMap::new();
-    validator_voting_power.insert(staking_account_address, TendermintVotePower::zero());
-
-    let rewards_pool = Coin::zero();
-    let mut distribution = BTreeMap::new();
-    distribution.insert(address, (StakedStateDestination::Bonded, Coin::max()));
-
-    let mut nodes = BTreeMap::new();
-    let node_pubkey = ValidatorPubkey {
-        consensus_pubkey_type: ValidatorKeyType::Ed25519,
-        consensus_pubkey_b64: "EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=".to_string(),
-    };
-    nodes.insert(address, node_pubkey);
-
-    let init_network_params = InitNetworkParameters {
-        initial_fee_policy: LinearFee::new(Milli::new(0, 0), Milli::new(0, 0)),
-        required_council_node_stake: Coin::max(),
-        unbonding_period: 1,
-        jailing_config: JailingParameters {
-            jail_duration: 60,
-            block_signing_window: 5,
-            missed_block_threshold: 1,
-        },
-        slashing_config: SlashingParameters {
-            liveness_slash_percent: SlashRatio::from_str("0.1").unwrap(),
-            byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
-            slash_wait_period: 10800,
-        },
-    };
-
-    let init_config = InitConfig::new(
-        rewards_pool,
-        distribution,
-        init_network_params.clone(),
-        nodes,
-    );
-
-    let timestamp = Timestamp::new();
-
-    let (accounts, rewards_pool_state, _) = init_config
-        .validate_config_get_genesis(timestamp.get_seconds())
-        .expect("Error while validating distribution");
-
-    let mut keys: Vec<StarlingFixedKey> = accounts.iter().map(|account| account.key()).collect();
-    let mut wrapped: Vec<AccountWrapper> = accounts
-        .iter()
-        .map(|account| AccountWrapper(account.clone()))
-        .collect();
-    let new_account_root = account_storage
-        .insert(None, &mut keys, &mut wrapped)
-        .expect("initial insert");
-
-    let transaction_tree = MerkleTree::empty();
-
-    let genesis_app_hash = compute_app_hash(
-        &transaction_tree,
-        &new_account_root,
-        &rewards_pool_state,
-        &NetworkParameters::Genesis(init_network_params),
-    );
-
-    let mut app = ChainNodeApp::new_with_storage(
-        get_enclave_bridge_mock(),
-        &hex::encode_upper(genesis_app_hash),
-        TEST_CHAIN_ID,
-        storage,
-        account_storage,
-        None,
-    );
-
-    // Init Chain
-
-    let mut request_init_chain = RequestInitChain::default();
-    request_init_chain.set_time(timestamp);
-    request_init_chain.set_app_state_bytes(serde_json::to_vec(&init_config).unwrap());
-    request_init_chain.set_chain_id(String::from(TEST_CHAIN_ID));
-    let response_init_chain = app.init_chain(&request_init_chain);
-
-    let validators = response_init_chain.validators.to_vec();
-
-    assert_eq!(1, validators.len());
-    assert_eq!(
-        100000000000,
-        i64::from(
-            *app.validator_voting_power
-                .get(&staking_account_address)
-                .unwrap()
-        )
-    );
-
-    // Begin Block
-
-    let mut request_begin_block = RequestBeginBlock::default();
-    let mut header = Header::default();
-    header.time = Some(Timestamp::new()).into();
-    header.chain_id = TEST_CHAIN_ID.to_owned();
-    header.height = 1;
-
-    request_begin_block.set_header(header);
-    app.begin_block(&request_begin_block);
-
-    // Unbond Transaction (this'll change voting power to zero)
-
-    let transaction = UnbondTx::new(
-        staking_account_address,
-        0,
-        Coin::new(10000000000).unwrap(),
-        StakedStateOpAttributes::new(0),
-    );
-    let witness =
-        StakedStateOpWitness::new(get_ecdsa_witness(&secp, &transaction.id(), &secret_key));
-    let tx_aux = TxAux::UnbondStakeTx(transaction, witness);
-
-    let mut request_deliver_tx = RequestDeliverTx::default();
-    request_deliver_tx.set_tx(tx_aux.encode());
-    let response_deliver_tx = app.deliver_tx(&request_deliver_tx);
-
-    assert_eq!(0, response_deliver_tx.code);
-    assert_eq!(
-        0,
-        i64::from(
-            *app.power_changed_in_block
-                .get(&staking_account_address)
-                .expect("Power did not change after unbonding funds")
-        )
-    );
-
-    // End Block (this'll remove validator from liveness tracker)
-
-    let validator_address: TendermintValidatorAddress = into_tendermint_validator_pub_key(
-        app.validator_pubkeys.get(&staking_account_address).unwrap(),
-    )
-    .into();
-    assert!(app
-        .last_state
-        .as_ref()
-        .unwrap()
-        .punishment
-        .validator_liveness
-        .contains_key(&validator_address));
-
-    let mut request_end_block = RequestEndBlock::default();
-    request_end_block.height = 1;
-    let response_end_block = app.end_block(&request_end_block);
-
-    assert_eq!(1, response_end_block.validator_updates.to_vec().len());
-    assert_eq!(0, response_end_block.validator_updates.to_vec()[0].power);
-    assert_eq!(
-        0,
-        i64::from(
-            *app.validator_voting_power
-                .get(&staking_account_address)
-                .unwrap()
-        )
-    );
-    assert!(!app
-        .last_state
-        .as_ref()
-        .unwrap()
-        .punishment
-        .validator_liveness
-        .contains_key(&validator_address));
-}
-
-#[test]
-fn begin_block_should_jail_byzantine_validators() {
-    use chain_abci::app::into_tendermint_validator_pub_key;
-    use chain_core::state::tendermint::TendermintValidatorAddress;
-    use protobuf::well_known_types::Timestamp;
-
-    let storage = Storage::new_db(create_db());
-    let mut account_storage =
-        AccountStorage::new(Storage::new_db(Arc::new(create(1))), 20).expect("account db");
-
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("32 bytes, within curve order");
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-    let address = RedeemAddress::from(&public_key);
-    let staking_account_address = StakedStateAddress::BasicRedeem(address);
-
-    let mut distribution = BTreeMap::new();
-    let rewards_pool = Coin::zero();
-    distribution.insert(address, (StakedStateDestination::Bonded, Coin::max()));
-
-    let init_network_params = InitNetworkParameters {
-        initial_fee_policy: LinearFee::new(Milli::new(0, 0), Milli::new(0, 0)),
-        required_council_node_stake: Coin::max(),
-        unbonding_period: 1,
-        jailing_config: JailingParameters {
-            jail_duration: 60,
-            block_signing_window: 5,
-            missed_block_threshold: 1,
-        },
-        slashing_config: SlashingParameters {
-            liveness_slash_percent: SlashRatio::from_str("0.1").unwrap(),
-            byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
-            slash_wait_period: 10800,
-        },
-    };
-
-    let mut nodes = BTreeMap::new();
-    let node_pubkey = ValidatorPubkey {
-        consensus_pubkey_type: ValidatorKeyType::Ed25519,
-        consensus_pubkey_b64: "EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=".to_string(),
-    };
-    nodes.insert(address, node_pubkey);
-
-    let init_config = InitConfig::new(
-        rewards_pool,
-        distribution,
-        init_network_params.clone(),
-        nodes,
-    );
-
-    let timestamp = Timestamp::new();
-
-    let (accounts, rewards_pool_state, _) = init_config
-        .validate_config_get_genesis(timestamp.get_seconds())
-        .expect("Error while validating distribution");
-
-    let mut keys: Vec<StarlingFixedKey> = accounts.iter().map(|account| account.key()).collect();
-    let mut wrapped: Vec<AccountWrapper> = accounts
-        .iter()
-        .map(|account| AccountWrapper(account.clone()))
-        .collect();
-    let new_account_root = account_storage
-        .insert(None, &mut keys, &mut wrapped)
-        .expect("initial insert");
-
-    let transaction_tree = MerkleTree::empty();
-
-    let genesis_app_hash = compute_app_hash(
-        &transaction_tree,
-        &new_account_root,
-        &rewards_pool_state,
-        &NetworkParameters::Genesis(init_network_params),
-    );
-
-    let mut app = ChainNodeApp::new_with_storage(
-        get_enclave_bridge_mock(),
-        &hex::encode_upper(genesis_app_hash),
-        TEST_CHAIN_ID,
-        storage,
-        account_storage,
-        None,
-    );
-
-    // Init Chain
-
-    let mut request_init_chain = RequestInitChain::default();
-    request_init_chain.set_time(timestamp);
-    request_init_chain.set_app_state_bytes(serde_json::to_vec(&init_config).unwrap());
-    request_init_chain.set_chain_id(String::from(TEST_CHAIN_ID));
-    let response_init_chain = app.init_chain(&request_init_chain);
-
-    let validators = response_init_chain.validators.to_vec();
-
-    assert_eq!(1, validators.len());
-    assert_eq!(
-        100000000000,
-        i64::from(
-            *app.validator_voting_power
-                .get(&staking_account_address)
-                .unwrap()
-        )
-    );
-
-    // Begin Block
-
-    let validator_address: TendermintValidatorAddress = into_tendermint_validator_pub_key(
-        app.validator_pubkeys.get(&staking_account_address).unwrap(),
-    )
-    .into();
-
-    let mut request_begin_block = RequestBeginBlock::default();
-    let mut header = Header::default();
-    header.time = Some(Timestamp::new()).into();
-    header.chain_id = TEST_CHAIN_ID.to_owned();
-    header.height = 1;
-
-    let mut validator = Validator::new();
-    validator.address = <[u8; 20]>::from(&validator_address).to_vec();
-
-    let mut evidence = Evidence::new();
-    evidence.validator = Some(validator).into();
-
-    request_begin_block.header = Some(header).into();
-    request_begin_block.byzantine_validators = vec![evidence].into();
-    app.begin_block(&request_begin_block);
-
-    assert_eq!(
-        TendermintVotePower::zero(),
-        *app.power_changed_in_block
-            .get(&staking_account_address)
-            .unwrap()
-    );
-
-    let account = get_account(&address, &app);
-    assert!(account.is_jailed());
-}
-
-#[test]
-fn begin_block_should_jail_non_live_validators() {
-    use chain_abci::app::into_tendermint_validator_pub_key;
-    use chain_core::state::tendermint::TendermintValidatorAddress;
-    use protobuf::well_known_types::Timestamp;
-
-    let storage = Storage::new_db(create_db());
-    let mut account_storage =
-        AccountStorage::new(Storage::new_db(Arc::new(create(1))), 20).expect("account db");
-
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("32 bytes, within curve order");
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-    let address = RedeemAddress::from(&public_key);
-    let staking_account_address = StakedStateAddress::BasicRedeem(address);
-
-    let mut validator_pubkey = PubKey::new();
-    validator_pubkey.field_type = "Ed25519".to_string();
-    validator_pubkey.data = base64::decode("EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=").unwrap();
-
-    let mut validator_voting_power = BTreeMap::new();
-    validator_voting_power.insert(staking_account_address, TendermintVotePower::zero());
-
-    let rewards_pool = Coin::zero();
-    let mut distribution = BTreeMap::new();
-    distribution.insert(address, (StakedStateDestination::Bonded, Coin::max()));
-
-    let init_network_params = InitNetworkParameters {
-        initial_fee_policy: LinearFee::new(Milli::new(0, 0), Milli::new(0, 0)),
-        required_council_node_stake: Coin::max(),
-        unbonding_period: 1,
-        jailing_config: JailingParameters {
-            jail_duration: 60,
-            block_signing_window: 5,
-            missed_block_threshold: 1,
-        },
-        slashing_config: SlashingParameters {
-            liveness_slash_percent: SlashRatio::from_str("0.1").unwrap(),
-            byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
-            slash_wait_period: 10800,
-        },
-    };
-    let mut nodes = BTreeMap::new();
-    let node_pubkey = ValidatorPubkey {
-        consensus_pubkey_type: ValidatorKeyType::Ed25519,
-        consensus_pubkey_b64: "EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=".to_string(),
-    };
-    nodes.insert(address, node_pubkey);
-    let init_config = InitConfig::new(
-        rewards_pool,
-        distribution,
-        init_network_params.clone(),
-        nodes,
-    );
-
-    let timestamp = Timestamp::new();
-
-    let (accounts, rewards_pool_state, _) = init_config
-        .validate_config_get_genesis(timestamp.get_seconds())
-        .expect("Error while validating distribution");
-
-    let mut keys: Vec<StarlingFixedKey> = accounts.iter().map(|account| account.key()).collect();
-    let mut wrapped: Vec<AccountWrapper> = accounts
-        .iter()
-        .map(|account| AccountWrapper(account.clone()))
-        .collect();
-    let new_account_root = account_storage
-        .insert(None, &mut keys, &mut wrapped)
-        .expect("initial insert");
-
-    let transaction_tree = MerkleTree::empty();
-
-    let genesis_app_hash = compute_app_hash(
-        &transaction_tree,
-        &new_account_root,
-        &rewards_pool_state,
-        &NetworkParameters::Genesis(init_network_params),
-    );
-
-    let mut app = ChainNodeApp::new_with_storage(
-        get_enclave_bridge_mock(),
-        &hex::encode_upper(genesis_app_hash),
-        TEST_CHAIN_ID,
-        storage,
-        account_storage,
-        None,
-    );
-
-    // Init Chain
-
-    let mut request_init_chain = RequestInitChain::default();
-    request_init_chain.set_time(timestamp);
-    request_init_chain.set_app_state_bytes(serde_json::to_vec(&init_config).unwrap());
-    request_init_chain.set_chain_id(String::from(TEST_CHAIN_ID));
-    let response_init_chain = app.init_chain(&request_init_chain);
-
-    let validators = response_init_chain.validators.to_vec();
-
-    assert_eq!(1, validators.len());
-    assert_eq!(
-        100000000000,
-        i64::from(
-            *app.validator_voting_power
-                .get(&staking_account_address)
-                .unwrap()
-        )
-    );
-
-    // Begin Block
-
-    let validator_address: TendermintValidatorAddress = into_tendermint_validator_pub_key(
-        app.validator_pubkeys.get(&staking_account_address).unwrap(),
-    )
-    .into();
-
-    let mut request_begin_block = RequestBeginBlock::default();
-    let mut header = Header::default();
-    header.time = Some(Timestamp::new()).into();
-    header.chain_id = TEST_CHAIN_ID.to_owned();
-    header.height = 2;
-
-    let mut validator = Validator::new();
-    validator.address = <[u8; 20]>::from(&validator_address).to_vec();
-
-    let mut vote_info = VoteInfo::new();
-    vote_info.validator = Some(validator).into();
-    vote_info.signed_last_block = false;
-
-    let mut last_commit_info = LastCommitInfo::new();
-    last_commit_info.votes = vec![vote_info].into();
-
-    request_begin_block.header = Some(header).into();
-    request_begin_block.last_commit_info = Some(last_commit_info).into();
-    app.begin_block(&request_begin_block);
-
-    assert_eq!(
-        TendermintVotePower::zero(),
-        *app.power_changed_in_block
-            .get(&staking_account_address)
-            .unwrap()
-    );
-
-    let account = get_account(&address, &app);
-    assert!(account.is_jailed());
-}
-
-#[test]
-fn begin_block_should_slash_byzantine_validators() {
-    use chain_abci::app::into_tendermint_validator_pub_key;
-    use chain_core::state::tendermint::TendermintValidatorAddress;
-    use protobuf::well_known_types::Timestamp;
-
-    let storage = Storage::new_db(create_db());
-    let mut account_storage =
-        AccountStorage::new(Storage::new_db(Arc::new(create(1))), 20).expect("account db");
-
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("32 bytes, within curve order");
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-    let address = RedeemAddress::from(&public_key);
-    let staking_account_address = StakedStateAddress::BasicRedeem(address);
-
-    let mut validator_pubkey = PubKey::new();
-    validator_pubkey.field_type = "Ed25519".to_string();
-    validator_pubkey.data = base64::decode("EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=").unwrap();
-
-    let mut validator_voting_power = BTreeMap::new();
-    validator_voting_power.insert(staking_account_address, TendermintVotePower::zero());
-
-    let rewards_pool = Coin::zero();
-    let mut distribution = BTreeMap::new();
-    distribution.insert(address, (StakedStateDestination::Bonded, Coin::max()));
-
-    let init_network_params = InitNetworkParameters {
-        initial_fee_policy: LinearFee::new(Milli::new(0, 0), Milli::new(0, 0)),
-        required_council_node_stake: Coin::max(),
-        unbonding_period: 1,
-        jailing_config: JailingParameters {
-            jail_duration: 60,
-            block_signing_window: 5,
-            missed_block_threshold: 1,
-        },
-        slashing_config: SlashingParameters {
-            liveness_slash_percent: SlashRatio::from_str("0.1").unwrap(),
-            byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
-            slash_wait_period: 5,
-        },
-    };
-
-    let mut nodes = BTreeMap::new();
-    let node_pubkey = ValidatorPubkey {
-        consensus_pubkey_type: ValidatorKeyType::Ed25519,
-        consensus_pubkey_b64: "EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=".to_string(),
-    };
-    nodes.insert(address, node_pubkey);
-    let init_config = InitConfig::new(
-        rewards_pool,
-        distribution,
-        init_network_params.clone(),
-        nodes,
-    );
-
-    let timestamp = Timestamp::new();
-
-    let (accounts, rewards_pool_state, _) = init_config
-        .validate_config_get_genesis(timestamp.get_seconds())
-        .expect("Error while validating distribution");
-
-    let mut keys: Vec<StarlingFixedKey> = accounts.iter().map(|account| account.key()).collect();
-    let mut wrapped: Vec<AccountWrapper> = accounts
-        .iter()
-        .map(|account| AccountWrapper(account.clone()))
-        .collect();
-    let new_account_root = account_storage
-        .insert(None, &mut keys, &mut wrapped)
-        .expect("initial insert");
-
-    let transaction_tree = MerkleTree::empty();
-
-    let genesis_app_hash = compute_app_hash(
-        &transaction_tree,
-        &new_account_root,
-        &rewards_pool_state,
-        &NetworkParameters::Genesis(init_network_params),
-    );
-
-    let mut app = ChainNodeApp::new_with_storage(
-        get_enclave_bridge_mock(),
-        &hex::encode_upper(genesis_app_hash),
-        TEST_CHAIN_ID,
-        storage,
-        account_storage,
-        None,
-    );
-
-    // Init Chain
-
-    let mut request_init_chain = RequestInitChain::default();
-    request_init_chain.set_time(timestamp);
-    request_init_chain.set_app_state_bytes(serde_json::to_vec(&init_config).unwrap());
-    request_init_chain.set_chain_id(String::from(TEST_CHAIN_ID));
-    let response_init_chain = app.init_chain(&request_init_chain);
-
-    let validators = response_init_chain.validators.to_vec();
-
-    assert_eq!(1, validators.len());
-    assert_eq!(
-        100000000000,
-        i64::from(
-            *app.validator_voting_power
-                .get(&staking_account_address)
-                .unwrap()
-        )
-    );
-
-    // Begin Block
-
-    let validator_address: TendermintValidatorAddress = into_tendermint_validator_pub_key(
-        app.validator_pubkeys.get(&staking_account_address).unwrap(),
-    )
-    .into();
-
-    let mut request_begin_block = RequestBeginBlock::default();
-    let mut header = Header::default();
-    header.time = Some(Timestamp::new()).into();
-    header.chain_id = TEST_CHAIN_ID.to_owned();
-    header.height = 1;
-
-    let mut validator = Validator::new();
-    validator.address = <[u8; 20]>::from(&validator_address).to_vec();
-
-    let mut evidence = Evidence::new();
-    evidence.validator = Some(validator).into();
-
-    request_begin_block.header = Some(header).into();
-    request_begin_block.byzantine_validators = vec![evidence].into();
-    app.begin_block(&request_begin_block);
-
-    assert_eq!(
-        TendermintVotePower::zero(),
-        *app.power_changed_in_block
-            .get(&staking_account_address)
-            .unwrap()
-    );
-
-    let account = get_account(&address, &app);
-    assert!(account.is_jailed());
-
-    assert!(app
-        .last_state
-        .as_ref()
-        .unwrap()
-        .punishment
-        .slashing_schedule
-        .contains_key(&staking_account_address));
-
-    // End Block
-
-    let request_end_block = RequestEndBlock::new();
-    app.end_block(&request_end_block);
-
-    assert_eq!(
-        Coin::zero(),
-        app.last_state.as_ref().unwrap().rewards_pool.remaining
-    );
-
-    // Begin Block
-
-    let mut request_begin_block = RequestBeginBlock::default();
-
-    let mut time = Timestamp::new();
-    time.seconds = 10;
-
-    let mut header = Header::default();
-    header.time = Some(time).into();
-    header.chain_id = TEST_CHAIN_ID.to_owned();
-    header.height = 1;
-
-    request_begin_block.header = Some(header).into();
-
-    app.begin_block(&request_begin_block);
-
-    assert!(!app
-        .last_state
-        .as_ref()
-        .unwrap()
-        .punishment
-        .slashing_schedule
-        .contains_key(&staking_account_address));
-
-    assert_eq!(
-        Coin::new((u64::from(Coin::max()) / 10) * 2).unwrap(), // 0.2 * account_balance
-        app.last_state.as_ref().unwrap().rewards_pool.remaining
-    );
-}
-
-#[test]
-fn begin_block_should_slash_non_live_validators() {
-    use chain_abci::app::into_tendermint_validator_pub_key;
-    use chain_core::state::tendermint::TendermintValidatorAddress;
-    use protobuf::well_known_types::Timestamp;
-
-    let storage = Storage::new_db(create_db());
-    let mut account_storage =
-        AccountStorage::new(Storage::new_db(Arc::new(create(1))), 20).expect("account db");
-
-    let secp = Secp256k1::new();
-    let secret_key = SecretKey::from_slice(&[0xcd; 32]).expect("32 bytes, within curve order");
-    let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-    let address = RedeemAddress::from(&public_key);
-    let staking_account_address = StakedStateAddress::BasicRedeem(address);
-
-    let mut validator_pubkey = PubKey::new();
-    validator_pubkey.field_type = "Ed25519".to_string();
-    validator_pubkey.data = base64::decode("EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=").unwrap();
-
-    let mut validator_voting_power = BTreeMap::new();
-    validator_voting_power.insert(staking_account_address, TendermintVotePower::zero());
-
-    let rewards_pool = Coin::zero();
-    let mut distribution = BTreeMap::new();
-    distribution.insert(address, (StakedStateDestination::Bonded, Coin::max()));
-
-    let init_network_params = InitNetworkParameters {
-        initial_fee_policy: LinearFee::new(Milli::new(0, 0), Milli::new(0, 0)),
-        required_council_node_stake: Coin::max(),
-        unbonding_period: 1,
-        jailing_config: JailingParameters {
-            jail_duration: 60,
-            block_signing_window: 5,
-            missed_block_threshold: 1,
-        },
-        slashing_config: SlashingParameters {
-            liveness_slash_percent: SlashRatio::from_str("0.1").unwrap(),
-            byzantine_slash_percent: SlashRatio::from_str("0.2").unwrap(),
-            slash_wait_period: 5,
-        },
-    };
-    let mut nodes = BTreeMap::new();
-    let node_pubkey = ValidatorPubkey {
-        consensus_pubkey_type: ValidatorKeyType::Ed25519,
-        consensus_pubkey_b64: "EIosObgfONUsnWCBGRpFlRFq5lSxjGIChRlVrVWVkcE=".to_string(),
-    };
-    nodes.insert(address, node_pubkey);
-
-    let init_config = InitConfig::new(
-        rewards_pool,
-        distribution,
-        init_network_params.clone(),
-        nodes,
-    );
-
-    let timestamp = Timestamp::new();
-
-    let (accounts, rewards_pool_state, _) = init_config
-        .validate_config_get_genesis(timestamp.get_seconds())
-        .expect("Error while validating distribution");
-
-    let mut keys: Vec<StarlingFixedKey> = accounts.iter().map(|account| account.key()).collect();
-    let mut wrapped: Vec<AccountWrapper> = accounts
-        .iter()
-        .map(|account| AccountWrapper(account.clone()))
-        .collect();
-    let new_account_root = account_storage
-        .insert(None, &mut keys, &mut wrapped)
-        .expect("initial insert");
-
-    let transaction_tree = MerkleTree::empty();
-
-    let genesis_app_hash = compute_app_hash(
-        &transaction_tree,
-        &new_account_root,
-        &rewards_pool_state,
-        &NetworkParameters::Genesis(init_network_params),
-    );
-
-    let mut app = ChainNodeApp::new_with_storage(
-        get_enclave_bridge_mock(),
-        &hex::encode_upper(genesis_app_hash),
-        TEST_CHAIN_ID,
-        storage,
-        account_storage,
-        None,
-    );
-
-    // Init Chain
-
-    let mut request_init_chain = RequestInitChain::default();
-    request_init_chain.set_time(timestamp);
-    request_init_chain.set_app_state_bytes(serde_json::to_vec(&init_config).unwrap());
-    request_init_chain.set_chain_id(String::from(TEST_CHAIN_ID));
-    let response_init_chain = app.init_chain(&request_init_chain);
-
-    let validators = response_init_chain.validators.to_vec();
-
-    assert_eq!(1, validators.len());
-    assert_eq!(
-        100000000000,
-        i64::from(
-            *app.validator_voting_power
-                .get(&staking_account_address)
-                .unwrap()
-        )
-    );
-
-    // Begin Block
-
-    let validator_address: TendermintValidatorAddress = into_tendermint_validator_pub_key(
-        app.validator_pubkeys.get(&staking_account_address).unwrap(),
-    )
-    .into();
-
-    let mut request_begin_block = RequestBeginBlock::default();
-    let mut header = Header::default();
-    header.time = Some(Timestamp::new()).into();
-    header.chain_id = TEST_CHAIN_ID.to_owned();
-    header.height = 2;
-
-    let mut validator = Validator::new();
-    validator.address = <[u8; 20]>::from(&validator_address).to_vec();
-
-    let mut vote_info = VoteInfo::new();
-    vote_info.validator = Some(validator).into();
-    vote_info.signed_last_block = false;
-
-    let mut last_commit_info = LastCommitInfo::new();
-    last_commit_info.votes = vec![vote_info].into();
-
-    request_begin_block.header = Some(header).into();
-    request_begin_block.last_commit_info = Some(last_commit_info).into();
-    app.begin_block(&request_begin_block);
-
-    assert_eq!(
-        TendermintVotePower::zero(),
-        *app.power_changed_in_block
-            .get(&staking_account_address)
-            .unwrap()
-    );
-
-    let account = get_account(&address, &app);
-    assert!(account.is_jailed());
-
-    assert!(app
-        .last_state
-        .as_ref()
-        .unwrap()
-        .punishment
-        .slashing_schedule
-        .contains_key(&staking_account_address));
-
-    // End Block
-
-    let request_end_block = RequestEndBlock::new();
-    app.end_block(&request_end_block);
-
-    assert_eq!(
-        Coin::zero(),
-        app.last_state.as_ref().unwrap().rewards_pool.remaining
-    );
-
-    // Begin Block
-
-    let mut request_begin_block = RequestBeginBlock::default();
-
-    let mut time = Timestamp::new();
-    time.seconds = 10;
-
-    let mut header = Header::default();
-    header.time = Some(time).into();
-    header.chain_id = TEST_CHAIN_ID.to_owned();
-    header.height = 1;
-
-    request_begin_block.header = Some(header).into();
-
-    app.begin_block(&request_begin_block);
-
-    assert!(!app
-        .last_state
-        .as_ref()
-        .unwrap()
-        .punishment
-        .slashing_schedule
-        .contains_key(&staking_account_address));
-
-    assert_eq!(
-        Coin::new(u64::from(Coin::max()) / 10).unwrap(), // 0.1 * account_balance
-        app.last_state.as_ref().unwrap().rewards_pool.remaining
-    );
+    block_commit(&mut app, unbondtx, 5);
+    {
+        let account = get_account(&addr, &app);
+        assert_eq!(account.unbonded, Coin::unit());
+        assert_eq!(account.nonce, 4);
+    }
 }

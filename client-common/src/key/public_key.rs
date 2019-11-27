@@ -59,6 +59,11 @@ impl PublicKey {
         self.0.serialize_uncompressed()[..].to_vec()
     }
 
+    /// Serializes current public key in compressed form
+    pub fn serialize_compressed(&self) -> Vec<u8> {
+        self.0.serialize()[..].to_vec()
+    }
+
     /// Deserializes public key from bytes
     pub fn deserialize_from(bytes: &[u8]) -> Result<PublicKey> {
         let public_key: SecpPublicKey = SecpPublicKey::from_slice(bytes).chain(|| {
@@ -69,6 +74,15 @@ impl PublicKey {
         })?;
 
         Ok(PublicKey(public_key))
+    }
+
+    /// Combine multiple public keys into one and returns as RawPubKey
+    pub fn combine_to_raw_pubkey(public_keys: &[PublicKey]) -> Result<RawPubkey> {
+        if public_keys.len() == 1 {
+            Ok(RawPubkey::from(&public_keys[0]))
+        } else {
+            Ok(RawPubkey::from(PublicKey::combine(&public_keys)?.0))
+        }
     }
 
     /// Combines multiple public keys into one and also returns hash of combined public key

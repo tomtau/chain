@@ -99,7 +99,7 @@ pub enum IntraEnclaveResponseOk {
     /// deposit stake pays minimal fee, so this returns the sum of input amounts -- staked stake's bonded balance is added `input_coins-min_fee`
     DepositStakeTx { input_coins: Coin },
     /// transaction filter
-    EndBlock(Box<TxFilter>),
+    EndBlock(Option<Box<TxFilter>>),
     /// encryption response
     Encrypt(TxObfuscated),
 }
@@ -167,7 +167,7 @@ pub enum EnclaveResponse {
     /// returns the affected (account) state (if any) and paid fee if the TX is valid
     VerifyTx(Result<(Fee, Option<StakedState>), chain_tx_validation::Error>),
     /// returns the transaction filter for the current block
-    EndBlock(Result<Box<TxFilter>, ()>),
+    EndBlock(Result<Option<Box<TxFilter>>, ()>),
     /// returns if the data was successfully persisted in the enclave's local storage
     CommitBlock(Result<(), ()>),
     /// returns Some(sealed data payloads) or None (if any TXID was not found / invalid)
@@ -201,7 +201,7 @@ pub enum TxQueryInitResponse {
 pub enum EncryptionRequest {
     TransferTx(Tx, TxWitness),
     DepositStake(DepositBondTx, TxWitness),
-    WithdrawStake(WithdrawUnbondedTx, StakedState, StakedStateOpWitness),
+    WithdrawStake(WithdrawUnbondedTx, Box<StakedState>, StakedStateOpWitness),
 }
 
 impl Decode for EncryptionRequest {
@@ -225,7 +225,7 @@ impl Decode for EncryptionRequest {
             )),
             2 => Ok(EncryptionRequest::WithdrawStake(
                 WithdrawUnbondedTx::decode(input)?,
-                StakedState::decode(input)?,
+                Box::new(StakedState::decode(input)?),
                 StakedStateOpWitness::decode(input)?,
             )),
             _ => Err("No such variant in enum EncryptionRequest".into()),

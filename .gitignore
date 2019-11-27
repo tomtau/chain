@@ -13,6 +13,11 @@
 # IDE
 .vscode
 .idea
+/tags
 
 # TODOR
 .todor
+
+# SSH
+id_rsa
+id_ecdsa

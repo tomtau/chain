@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 
-use bip39::{Language, Mnemonic, MnemonicType};
 use parity_scale_codec::Encode;
 use secp256k1::schnorrsig::SchnorrSignature;
 use secstr::SecUtf8;
@@ -17,7 +16,7 @@ use chain_core::tx::data::Tx;
 use chain_core::tx::witness::tree::RawPubkey;
 use chain_core::tx::witness::{TxInWitness, TxWitness};
 use chain_core::tx::TxAux;
-use client_common::tendermint::types::BroadcastTxResult;
+use client_common::tendermint::types::BroadcastTxResponse;
 use client_common::tendermint::{Client, UnauthorizedClient};
 use client_common::{
     Error, ErrorKind, PrivateKey, PublicKey, Result, ResultExt, SignedTransaction, Storage,
@@ -28,8 +27,8 @@ use crate::transaction_builder::UnauthorizedTransactionBuilder;
 use crate::types::WalletKind;
 use crate::types::{AddressType, BalanceChange, TransactionChange};
 use crate::{
-    InputSelectionStrategy, MultiSigWalletClient, TransactionBuilder, UnspentTransactions,
-    WalletClient,
+    InputSelectionStrategy, Mnemonic, MultiSigWalletClient, TransactionBuilder,
+    UnspentTransactions, WalletClient,
 };
 
 /// Default implementation of `WalletClient` based on `Storage` and `Index`
@@ -112,18 +111,23 @@ where
                     .map(|_| None)
             }
             WalletKind::HD => {
-                let mnemonic = Mnemonic::new(MnemonicType::Words24, Language::English);
+                let mnemonic = Mnemonic::new();
 
                 self.hd_key_service
                     .add_mnemonic(name, &mnemonic, passphrase)?;
 
-                let (view_key, _) =
-                    self.hd_key_service
-                        .generate_keypair(name, passphrase, AddressType::Staking)?;
+                let (public_key, private_key) = self.hd_key_service.generate_keypair(
+                    name,
+                    passphrase,
+                    AddressType::Transfer,
+                )?;
 
-                self.wallet_service
-                    .create(name, passphrase, view_key)
-                    .map(|_| Some(mnemonic))
+                self.key_service
+                    .add_keypair(&private_key, &public_key, passphrase)?;
+
+                self.wallet_service.create(name, passphrase, public_key)?;
+
+                Ok(Some(mnemonic))
             }
         }
     }
@@ -132,11 +136,14 @@ where
         self.hd_key_service
             .add_mnemonic(name, mnemonic, passphrase)?;
 
-        let (view_key, _) =
+        let (public_key, private_key) =
             self.hd_key_service
                 .generate_keypair(name, passphrase, AddressType::Transfer)?;
 
-        self.wallet_service.create(name, passphrase, view_key)
+        self.key_service
+            .add_keypair(&private_key, &public_key, passphrase)?;
+
+        self.wallet_service.create(name, passphrase, public_key)
     }
 
     #[inline]
@@ -283,7 +290,6 @@ where
             vec![public_key.clone()],
             public_key,
             1,
-            1,
         )
     }
 
@@ -294,7 +300,6 @@ where
         public_keys: Vec<PublicKey>,
         self_public_key: PublicKey,
         m: usize,
-        n: usize,
     ) -> Result<ExtendedAddr> {
         // Check if self public key belongs to current wallet
         let _ = self.private_key(passphrase, &self_public_key)?.chain(|| {
@@ -311,14 +316,14 @@ where
             ));
         }
 
-        let root_hash =
+        let (root_hash, multi_sig_address) =
             self.root_hash_service
-                .new_root_hash(public_keys, self_public_key, m, n, passphrase)?;
+                .new_root_hash(public_keys, self_public_key, m, passphrase)?;
 
         self.wallet_service
             .add_root_hash(name, passphrase, root_hash)?;
 
-        Ok(ExtendedAddr::OrTree(root_hash))
+        Ok(multi_sig_address.into())
     }
 
     fn generate_proof(
@@ -448,7 +453,7 @@ where
     }
 
     #[inline]
-    fn broadcast_transaction(&self, tx_aux: &TxAux) -> Result<BroadcastTxResult> {
+    fn broadcast_transaction(&self, tx_aux: &TxAux) -> Result<BroadcastTxResponse> {
         self.tendermint_client
             .broadcast_transaction(&tx_aux.encode())
     }

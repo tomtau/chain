@@ -5,7 +5,6 @@ pub use default_wallet_client::DefaultWalletClient;
 
 use std::collections::BTreeSet;
 
-use bip39::Mnemonic;
 use secp256k1::schnorrsig::SchnorrSignature;
 use secstr::SecUtf8;
 
@@ -20,11 +19,11 @@ use chain_core::tx::data::output::TxOut;
 use chain_core::tx::data::Tx;
 use chain_core::tx::witness::tree::RawPubkey;
 use chain_core::tx::TxAux;
-use client_common::tendermint::types::BroadcastTxResult;
+use client_common::tendermint::types::BroadcastTxResponse;
 use client_common::{PrivateKey, PublicKey, Result};
 
 use crate::types::{AddressType, TransactionChange, WalletKind};
-use crate::{InputSelectionStrategy, UnspentTransactions};
+use crate::{InputSelectionStrategy, Mnemonic, UnspentTransactions};
 
 /// Interface for a generic wallet
 pub trait WalletClient: Send + Sync {
@@ -114,7 +113,6 @@ pub trait WalletClient: Send + Sync {
     /// `public_keys`: Public keys of co-signers (including public key of current co-signer)
     /// `self_public_key`: Public key of current co-signer
     /// `m`: Number of required co-signers
-    /// `n`: Total number of co-signers
     fn new_multisig_transfer_address(
         &self,
         name: &str,
@@ -122,7 +120,6 @@ pub trait WalletClient: Send + Sync {
         public_keys: Vec<PublicKey>,
         self_public_key: PublicKey,
         m: usize,
-        n: usize,
     ) -> Result<ExtendedAddr>;
 
     /// Generates inclusion proof for set of public keys in multi-sig address
@@ -184,7 +181,7 @@ pub trait WalletClient: Send + Sync {
     ) -> Result<TxAux>;
 
     /// Broadcasts a transaction to Crypto.com Chain
-    fn broadcast_transaction(&self, tx_aux: &TxAux) -> Result<BroadcastTxResult>;
+    fn broadcast_transaction(&self, tx_aux: &TxAux) -> Result<BroadcastTxResponse>;
 }
 
 /// Interface for a generic wallet for multi-signature transactions

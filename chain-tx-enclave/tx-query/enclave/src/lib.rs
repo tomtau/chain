@@ -100,8 +100,8 @@ fn handle_decryption_request(
     }
 
     match tls.read(&mut plain) {
-        Ok(_) => {
-            if let Ok(dr) = DecryptionRequest::decode(&mut plain.as_slice()) {
+        Ok(l) => {
+            if let Ok(dr) = DecryptionRequest::decode(&mut &plain.as_slice()[0..l]) {
                 if dr
                     .verify(&Secp256k1::verification_only(), challenge)
                     .is_err()
@@ -264,12 +264,14 @@ fn handle_encryption_request(
 pub extern "C" fn run_server(socket_fd: c_int) -> sgx_status_t {
     let mut sess = rustls::ServerSession::new(&attest::get_tls_config());
     let mut conn = TcpStream::new(socket_fd).unwrap();
+    #[cfg(not(feature = "sgx-test"))]
     let _ = conn.set_read_timeout(Some(Duration::new(TIMEOUT_SEC, 0)));
+    #[cfg(not(feature = "sgx-test"))]
     let _ = conn.set_write_timeout(Some(Duration::new(TIMEOUT_SEC, 0)));
     let mut tls = rustls::Stream::new(&mut sess, &mut conn);
     let mut plain = vec![0; ENCRYPTION_REQUEST_SIZE];
     match tls.read(&mut plain) {
-        Ok(_) => match TxQueryInitRequest::decode(&mut plain.as_slice()) {
+        Ok(l) => match TxQueryInitRequest::decode(&mut &plain.as_slice()[0..l]) {
             Ok(TxQueryInitRequest::Encrypt(req)) => handle_encryption_request(&mut tls, *req),
             Ok(TxQueryInitRequest::DecryptChallenge) => handle_decryption_request(&mut tls, plain),
             _ => {
