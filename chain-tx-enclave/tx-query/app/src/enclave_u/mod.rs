@@ -77,8 +77,12 @@ pub extern "C" fn ocall_get_txs(
                             return sgx_status_t::SGX_SUCCESS;
                         }
                     }
-                    _ => {
+                    Ok(_) => {
                         error!("failed to decode a response for obtaining sealed data");
+                        return sgx_status_t::SGX_ERROR_UNEXPECTED;
+                    }
+                    Err(e) => {
+                        error!("failed to decode a response for obtaining sealed data: {:?}", e);
                         return sgx_status_t::SGX_ERROR_UNEXPECTED;
                     }
                 }
@@ -133,6 +137,7 @@ extern "C" {
         eid: sgx_enclave_id_t,
         retval: *mut sgx_status_t,
         socket_fd: c_int,
+        timeout: c_int,
     ) -> sgx_status_t;
 }
 
