@@ -35,8 +35,6 @@ mod attest;
 /// utility for generating the TLS cert with the RA payload
 mod cert;
 
-const TIMEOUT_SEC: u64 = 5;
-
 extern "C" {
     pub fn ocall_encrypt_request(
         ret_val: *mut sgx_status_t,
@@ -56,15 +54,18 @@ extern "C" {
 }
 
 fn process_decryption_request(body: &DecryptionRequestBody) -> Option<DecryptionResponse> {
-    let txids_enc = body.txs.encode();
+    let request = EnclaveRequest::GetSealedTxData {
+        txids: body.txs.clone(),
+    };
+    let req = request.encode();
     // TODO: check tx size
     let mut inputs_buf = vec![0u8; body.txs.len() * 8000];
     let mut rt: sgx_status_t = sgx_status_t::SGX_ERROR_UNEXPECTED;
     let result = unsafe {
         ocall_get_txs(
             &mut rt as *mut sgx_status_t,
-            txids_enc.as_ptr(),
-            txids_enc.len() as u32,
+            req.as_ptr(),
+            req.len() as u32,
             inputs_buf.as_mut_ptr(),
             inputs_buf.len() as u32,
         )
@@ -72,18 +73,19 @@ fn process_decryption_request(body: &DecryptionRequestBody) -> Option<Decryption
     if result != sgx_status_t::SGX_SUCCESS || rt != sgx_status_t::SGX_SUCCESS {
         return None;
     }
-    let inputs_enc: Result<Vec<Vec<u8>>, parity_scale_codec::Error> =
-        Decode::decode(&mut inputs_buf.as_slice());
-    if let Ok(inputs) = inputs_enc {
-        check_unseal(
+    match EnclaveResponse::decode(&mut inputs_buf.as_slice()) {
+        Ok(EnclaveResponse::GetSealedTxData(Some(inputs))) => check_unseal(
             Some(body.view_key),
             true,
             body.txs.iter().map(|x| *x),
             inputs,
         )
-        .map(|txs| DecryptionResponse { txs })
-    } else {
-        None
+        .map(|txs| DecryptionResponse { txs }),
+        Ok(EnclaveResponse::GetSealedTxData(None)) => Some(DecryptionResponse { txs: vec![] }),
+        _ => {
+            println!("failed to decode a response for obtaining sealed data");
+            None
+        }
     }
 }
 
