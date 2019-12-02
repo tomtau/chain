@@ -263,13 +263,14 @@ fn handle_encryption_request(
 /// - unseales the transactions and checks if the metadata contains the view key in the request
 /// - if so, it includes the transaction in the reply and sends it back
 #[no_mangle]
-pub extern "C" fn run_server(socket_fd: c_int) -> sgx_status_t {
+pub extern "C" fn run_server(socket_fd: c_int, timeout: c_int) -> sgx_status_t {
     let mut sess = rustls::ServerSession::new(&attest::get_tls_config());
     let mut conn = TcpStream::new(socket_fd).unwrap();
-    #[cfg(not(feature = "sgx-test"))]
-    let _ = conn.set_read_timeout(Some(Duration::new(TIMEOUT_SEC, 0)));
-    #[cfg(not(feature = "sgx-test"))]
-    let _ = conn.set_write_timeout(Some(Duration::new(TIMEOUT_SEC, 0)));
+    if timeout > 0 {
+        let utimeout = timeout.try_into().unwrap();
+        let _ = stream.set_read_timeout(Some(Duration::new(utimeout, 0)));
+        let _ = stream.set_write_timeout(Some(Duration::new(utimeout, 0)));
+    }
     let mut tls = rustls::Stream::new(&mut sess, &mut conn);
     let mut plain = vec![0; ENCRYPTION_REQUEST_SIZE];
     match tls.read(&mut plain) {
