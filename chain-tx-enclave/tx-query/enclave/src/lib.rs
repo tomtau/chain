@@ -29,6 +29,7 @@ use std::net::{Shutdown, TcpStream};
 use std::prelude::v1::*;
 use std::time::Duration;
 use std::vec::Vec;
+use std::convert::TryInto;
 
 /// functionality related to remote attestation (RA)
 mod attest;
@@ -268,8 +269,8 @@ pub extern "C" fn run_server(socket_fd: c_int, timeout: c_int) -> sgx_status_t {
     let mut conn = TcpStream::new(socket_fd).unwrap();
     if timeout > 0 {
         let utimeout = timeout.try_into().unwrap();
-        let _ = stream.set_read_timeout(Some(Duration::new(utimeout, 0)));
-        let _ = stream.set_write_timeout(Some(Duration::new(utimeout, 0)));
+        let _ = conn.set_read_timeout(Some(Duration::new(utimeout, 0)));
+        let _ = conn.set_write_timeout(Some(Duration::new(utimeout, 0)));
     }
     let mut tls = rustls::Stream::new(&mut sess, &mut conn);
     let mut plain = vec![0; ENCRYPTION_REQUEST_SIZE];
